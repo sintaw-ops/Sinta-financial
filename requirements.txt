@@ -1,5 +1,6 @@
-streamlit>=1.35.0
-pandas>=2.2.0
-plotly>=5.22.0
-openpyxl>=3.1.2
-psycopg2-binary>=2.9.9
+streamlit==1.32.0
+pandas==2.2.1
+psycopg2-binary==2.9.9
+plotly==5.19.0
+openpyxl==3.1.2
+pdfplumber==0.11.0
