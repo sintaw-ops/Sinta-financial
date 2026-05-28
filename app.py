@@ -1,9 +1,3 @@
-╔══════════════════════════════════════════════════════════════════════════════╗
-║   Personal Finance Dashboard  —  v5.1 "The CFO Console Cloud"              ║
-║   Supabase Backend · Pintu Satu Automation Compatible · Data Cleansing       ║
-║   Multi-bank · Manual Input · CFO-level Analytics · Sub-Category Budgets   ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-
 import streamlit as st
 import pandas as pd
 import psycopg2
