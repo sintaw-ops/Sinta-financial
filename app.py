@@ -56,14 +56,10 @@ CATEGORY_SEED = [
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_supabase_conn():
-    """Membuka koneksi aman ke database Supabase menggunakan Secrets Streamlit."""
-    return psycopg2.connect(
-        host=st.secrets["DB_HOST"],
-        database=st.secrets["DB_NAME"],
-        user=st.secrets["DB_USER"],
-        password=st.secrets["DB_PASSWORD"],
-        port=st.secrets["DB_PORT"]
-    )
+    """Membuka koneksi aman ke database Supabase Nano menggunakan URI Connection String."""
+    # Menyusun URI string untuk mem-bypass pemblokiran SSL Streamlit Cloud
+    db_uri = f"postgresql://{st.secrets['DB_USER']}:{st.secrets['DB_PASSWORD']}@{st.secrets['DB_HOST']}:{st.secrets['DB_PORT']}/{st.secrets['DB_NAME']}?sslmode=allow"
+    return psycopg2.connect(db_uri)
 
 def init_db():
     """Membuat tabel jika belum ada dan melakukan seeding master data kategori."""
