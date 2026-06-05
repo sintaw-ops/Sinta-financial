@@ -1759,69 +1759,94 @@ def tab_email_sync():
 
         import datetime as dt_mod
 
-        today     = datetime.now().date()
-        this_mon  = today.replace(day=1)
+        today    = datetime.now().date()
+        this_mon = today.replace(day=1)
 
-        # Quick-select buttons
-        st.markdown("**⚡ Pilih cepat:**")
-        qc = st.columns(6)
         QUICK = [
-            ("Hari ini",      today,                           today),
-            ("7 hari",        today - dt_mod.timedelta(days=6), today),
-            ("14 hari",       today - dt_mod.timedelta(days=13), today),
-            ("30 hari",       today - dt_mod.timedelta(days=29), today),
-            ("Bulan ini",     this_mon,                        today),
+            ("Hari ini",  today,                              today),
+            ("7 hari",    today - dt_mod.timedelta(days=6),   today),
+            ("14 hari",   today - dt_mod.timedelta(days=13),  today),
+            ("30 hari",   today - dt_mod.timedelta(days=29),  today),
+            ("Bulan ini", this_mon,                           today),
             ("Bulan lalu",
              (this_mon - dt_mod.timedelta(days=1)).replace(day=1),
              this_mon - dt_mod.timedelta(days=1)),
         ]
 
+        # ── Inisialisasi session state HANYA jika belum ada ──────────────────
+        # KUNCI FIX: jangan overwrite saat rerun dari tombol lain
         if "sync_from" not in st.session_state:
             st.session_state.sync_from = today - dt_mod.timedelta(days=6)
         if "sync_to" not in st.session_state:
             st.session_state.sync_to = today
 
+        # ── Quick-select buttons ──────────────────────────────────────────────
+        st.markdown("**⚡ Pilih cepat:**")
+        qc = st.columns(6)
         for i, (label, qfrom, qto) in enumerate(QUICK):
-            if qc[i].button(label, use_container_width=True, key=f"qb_{i}"):
+            # Highlight tombol yang aktif
+            is_active = (
+                st.session_state.sync_from == qfrom and
+                st.session_state.sync_to   == qto
+            )
+            btn_type = "primary" if is_active else "secondary"
+            if qc[i].button(label, use_container_width=True,
+                             key=f"qb_{i}", type=btn_type):
+                # Set session_state langsung, BUKAN via date_input
                 st.session_state.sync_from = qfrom
                 st.session_state.sync_to   = qto
+                # Update date_input widgets juga
+                st.session_state["di_from"] = qfrom
+                st.session_state["di_to"]   = qto
                 st.rerun()
 
-        # Date range manual input
+        # ── Date picker manual ────────────────────────────────────────────────
         st.markdown("**🗓️ Atau pilih tanggal manual:**")
         dc1, dc2 = st.columns(2)
-        date_from = dc1.date_input(
+
+        # Gunakan on_change callback agar perubahan manual tersimpan ke sync_from/to
+        def _on_from_change():
+            st.session_state.sync_from = st.session_state["di_from"]
+
+        def _on_to_change():
+            st.session_state.sync_to = st.session_state["di_to"]
+
+        dc1.date_input(
             "Dari tanggal",
             value=st.session_state.sync_from,
             max_value=today,
             key="di_from",
+            on_change=_on_from_change,
         )
-        date_to = dc2.date_input(
+        dc2.date_input(
             "Sampai tanggal",
             value=st.session_state.sync_to,
             max_value=today,
             key="di_to",
+            on_change=_on_to_change,
         )
+
+        # Baca final value dari session_state (source of truth tunggal)
+        date_from = st.session_state.sync_from
+        date_to   = st.session_state.sync_to
 
         if date_from > date_to:
             st.warning("⚠️ Tanggal awal harus sebelum tanggal akhir.")
             date_from, date_to = date_to, date_from
+            st.session_state.sync_from = date_from
+            st.session_state.sync_to   = date_to
 
-        # Sync state ke session
-        st.session_state.sync_from = date_from
-        st.session_state.sync_to   = date_to
+        days_back = (date_to - date_from).days + 1
 
-        days_back  = (date_to - date_from).days + 1
-
-        # Summary bar
+        # ── Summary bar ───────────────────────────────────────────────────────
         duration_label = (
             "Hari ini" if days_back == 1 and date_from == today
             else f"{days_back} hari"
         )
         r1, r2, r3 = st.columns(3)
-        r1.metric("📅 Dari",     date_from.strftime("%d %b %Y"))
-        r2.metric("📅 Sampai",   date_to.strftime("%d %b %Y"))
-        r3.metric("⏱️ Durasi",   duration_label)
+        r1.metric("📅 Dari",   date_from.strftime("%d %b %Y"))
+        r2.metric("📅 Sampai", date_to.strftime("%d %b %Y"))
+        r3.metric("⏱️ Durasi", duration_label)
 
         range_info = (
             f"Hari ini ({today.strftime('%d %b %Y')})"
@@ -1830,7 +1855,10 @@ def tab_email_sync():
         )
 
         # Anti-duplikat info
-        st.success("🛡️ **Anti-duplikat aktif** — aman dijalankan berkali-kali. Transaksi yang sudah ada di database akan otomatis dilewati.")
+        st.success(
+            "🛡️ **Anti-duplikat aktif** — aman dijalankan berkali-kali. "
+            "Transaksi yang sudah ada di database akan otomatis dilewati."
+        )
 
     st.divider()
 
