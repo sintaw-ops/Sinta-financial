@@ -1754,7 +1754,83 @@ def tab_email_sync():
             email_addr   = c1.text_input("Gmail Address", value="sintawuln@gmail.com")
             app_password = c2.text_input("App Password", type="password",
                                           placeholder="xxxx xxxx xxxx xxxx")
-        days_back = st.slider("Rentang waktu (hari ke belakang)", 1, 30, 7)
+        # ── Rentang Waktu ─────────────────────────────────────────────────────
+        st.markdown("#### 📅 Rentang Waktu Sinkronisasi")
+
+        import datetime as dt_mod
+
+        today     = datetime.now().date()
+        this_mon  = today.replace(day=1)
+
+        # Quick-select buttons
+        st.markdown("**⚡ Pilih cepat:**")
+        qc = st.columns(6)
+        QUICK = [
+            ("Hari ini",      today,                           today),
+            ("7 hari",        today - dt_mod.timedelta(days=6), today),
+            ("14 hari",       today - dt_mod.timedelta(days=13), today),
+            ("30 hari",       today - dt_mod.timedelta(days=29), today),
+            ("Bulan ini",     this_mon,                        today),
+            ("Bulan lalu",
+             (this_mon - dt_mod.timedelta(days=1)).replace(day=1),
+             this_mon - dt_mod.timedelta(days=1)),
+        ]
+
+        if "sync_from" not in st.session_state:
+            st.session_state.sync_from = today - dt_mod.timedelta(days=6)
+        if "sync_to" not in st.session_state:
+            st.session_state.sync_to = today
+
+        for i, (label, qfrom, qto) in enumerate(QUICK):
+            if qc[i].button(label, use_container_width=True, key=f"qb_{i}"):
+                st.session_state.sync_from = qfrom
+                st.session_state.sync_to   = qto
+                st.rerun()
+
+        # Date range manual input
+        st.markdown("**🗓️ Atau pilih tanggal manual:**")
+        dc1, dc2 = st.columns(2)
+        date_from = dc1.date_input(
+            "Dari tanggal",
+            value=st.session_state.sync_from,
+            max_value=today,
+            key="di_from",
+        )
+        date_to = dc2.date_input(
+            "Sampai tanggal",
+            value=st.session_state.sync_to,
+            max_value=today,
+            key="di_to",
+        )
+
+        if date_from > date_to:
+            st.warning("⚠️ Tanggal awal harus sebelum tanggal akhir.")
+            date_from, date_to = date_to, date_from
+
+        # Sync state ke session
+        st.session_state.sync_from = date_from
+        st.session_state.sync_to   = date_to
+
+        days_back  = (date_to - date_from).days + 1
+
+        # Summary bar
+        duration_label = (
+            "Hari ini" if days_back == 1 and date_from == today
+            else f"{days_back} hari"
+        )
+        r1, r2, r3 = st.columns(3)
+        r1.metric("📅 Dari",     date_from.strftime("%d %b %Y"))
+        r2.metric("📅 Sampai",   date_to.strftime("%d %b %Y"))
+        r3.metric("⏱️ Durasi",   duration_label)
+
+        range_info = (
+            f"Hari ini ({today.strftime('%d %b %Y')})"
+            if days_back == 1 and date_from == today
+            else f"{date_from.strftime('%d %b')} — {date_to.strftime('%d %b %Y')} ({days_back} hari)"
+        )
+
+        # Anti-duplikat info
+        st.success("🛡️ **Anti-duplikat aktif** — aman dijalankan berkali-kali. Transaksi yang sudah ada di database akan otomatis dilewati.")
 
     st.divider()
 
@@ -1771,7 +1847,7 @@ def tab_email_sync():
             st.warning("Masukkan Gmail address dan App Password terlebih dahulu.")
             st.stop()
 
-        with st.spinner(f"Menghubungkan ke Gmail dan membaca {days_back} hari terakhir..."):
+        with st.spinner(f"Menghubungkan ke Gmail · {range_info}..."):
             txs, raw_emails, err = fetch_email_transactions(email_addr, app_password, days_back)
 
         if err:
@@ -1801,12 +1877,19 @@ def tab_email_sync():
                 with st.spinner("Menyimpan ke database Supabase..."):
                     inserted, skipped = save_transactions(df_preview)
                 if inserted > 0:
-                    st.success(f"✅ **{inserted}** transaksi baru disimpan, **{skipped}** dilewati.")
+                    st.success(
+                        f"✅ **{inserted}** transaksi baru disimpan, "
+                        f"**{skipped}** dilewati (sudah ada / duplikat)."
+                    )
                     st.info("💡 Pergi ke **⚙️ Validasi Antrean** untuk mengkategorisasi transaksi baru.")
                 else:
-                    st.info(f"Tidak ada transaksi baru. {skipped} sudah ada (duplikat).")
+                    st.success(
+                        f"✅ Sinkronisasi selesai — tidak ada transaksi baru. "
+                        f"**{skipped}** transaksi sudah ada di database. "
+                        f"Aman dijalankan ulang kapan saja."
+                    )
             else:
-                st.info("Mode preview — belum disimpan. Klik 'Cek & Simpan' untuk menyimpan.")
+                st.info("Mode preview — belum disimpan. Klik **'Cek & Simpan'** untuk menyimpan.")
 
     st.divider()
     st.markdown("#### 📊 Histori Transaksi dari Email")
