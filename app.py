@@ -115,6 +115,24 @@ def init_db():
                 CONSTRAINT unique_tx UNIQUE(date, description, amount)
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pocket_balance (
+                id SERIAL PRIMARY KEY,
+                pocket_name TEXT NOT NULL UNIQUE,
+                balance REAL NOT NULL DEFAULT 0,
+                pocket_type TEXT NOT NULL DEFAULT 'bank',
+                is_cc BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("""
+            INSERT INTO pocket_balance (pocket_name, pocket_type, is_cc, balance)
+            VALUES
+                ('Bank Jago',  'bank', FALSE, 0),
+                ('Jenius CC',  'cc',   TRUE,  0),
+                ('Sinarmas',   'bank', FALSE, 0)
+            ON CONFLICT (pocket_name) DO NOTHING
+        """)
         # ── Migrasi: tambah kolom source jika belum ada ──────────────────────
         c.execute("""
             ALTER TABLE transactions
@@ -271,6 +289,80 @@ def update_budget(sub: str, new_budget: float):
     load_categories_df.clear()
 
 
+# ── Pocket Balance Functions ──────────────────────────────────────────────────
+
+@st.cache_data(ttl=60)
+def load_pocket_balances() -> pd.DataFrame:
+    return pd.read_sql_query(
+        "SELECT * FROM pocket_balance ORDER BY is_cc, pocket_name",
+        _conn()
+    )
+
+
+def update_pocket_balance(pocket_name: str, new_balance: float):
+    conn = _conn()
+    with conn.cursor() as c:
+        c.execute("""
+            INSERT INTO pocket_balance (pocket_name, balance, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (pocket_name)
+            DO UPDATE SET balance = EXCLUDED.balance, updated_at = NOW()
+        """, (pocket_name, new_balance))
+    conn.commit()
+    load_pocket_balances.clear()
+
+
+def add_pocket(pocket_name: str, pocket_type: str, is_cc: bool, balance: float):
+    conn = _conn()
+    with conn.cursor() as c:
+        c.execute("""
+            INSERT INTO pocket_balance (pocket_name, pocket_type, is_cc, balance)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (pocket_name) DO NOTHING
+        """, (pocket_name, pocket_type, is_cc, balance))
+    conn.commit()
+    load_pocket_balances.clear()
+
+
+def delete_pocket(pocket_name: str):
+    conn = _conn()
+    with conn.cursor() as c:
+        c.execute("DELETE FROM pocket_balance WHERE pocket_name = %s", (pocket_name,))
+    conn.commit()
+    load_pocket_balances.clear()
+
+
+def compute_net_balance(pocket_name: str, df_all: pd.DataFrame) -> dict:
+    """
+    Hitung net balance per pocket berdasarkan transaksi.
+    Untuk CC: balance = hutang (pengeluaran CC - pembayaran tagihan CC)
+    Untuk bank: balance = saldo (pemasukan - pengeluaran - transfer keluar + transfer masuk)
+    """
+    df_p = df_all[df_all["pocket"] == pocket_name].copy()
+    if df_p.empty:
+        return {"income": 0, "expense": 0, "transfer_in": 0, "transfer_out": 0, "net": 0}
+
+    income       = df_p[df_p["type"] == "Income"]["amount"].sum()
+    expense      = df_p[df_p["type"] == "Expense"]["amount"].sum()
+    transfer_out = df_p[df_p["type"] == "Transfer"]["amount"].sum()
+
+    # Transfer masuk = transaksi Transfer di pocket LAIN yang tujuannya ke pocket ini
+    # (Untuk CC: pembayaran tagihan = Transfer masuk ke CC)
+    cc_payments = df_all[
+        (df_all["type"] == "Transfer") &
+        (df_all["sub_category"] == "bayar tagihan cc") &
+        (df_all["description"].str.contains("jenius cc", case=False, na=False)
+         if pocket_name == "Jenius CC" else pd.Series([False]*len(df_all), index=df_all.index))
+    ]["amount"].sum()
+
+    net = income - expense - transfer_out + cc_payments
+    return {
+        "income": income, "expense": expense,
+        "transfer_out": transfer_out, "cc_payments": cc_payments,
+        "net": net,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 3 — PDF PARSER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -343,9 +435,46 @@ def _parse_email_date(date_str: str) -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def _extract_amount(text: str):
-    for pat in [r"IDR\s*([\d\.,]+)", r"Rp\.?\s*([\d\.,]+)", r"Rp\s*([\d\.]+)"]:
-        m = re.search(pat, text, re.IGNORECASE)
+def _extract_amount_jenius_cc(body: str) -> float | None:
+    """
+    Parser khusus Jenius CC.
+    Format email: 'Total: IDR 154,000.00'
+    Harus ambil angka SETELAH kata 'Total:' saja, bukan dari bagian lain email
+    (card number, dll yang bisa menghasilkan angka salah).
+    """
+    # Pola spesifik: Total: IDR xxx,xxx.xx
+    m = re.search(r"Total[:\s]+IDR\s*([\d,]+(?:\.\d{1,2})?)", body, re.IGNORECASE)
+    if m:
+        raw = m.group(1).replace(",", "")  # "154,000.00" → "154000.00"
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    # Fallback: cari "IDR xxx,xxx" pola umum tapi pastikan bukan card number
+    # Card number punya format: 437896******2961 (ada bintang), skip
+    body_clean = re.sub(r'\d{6}\*+\d{4}', '', body)  # hapus card number
+    m2 = re.search(r"IDR\s*([\d,]+(?:\.\d{1,2})?)", body_clean, re.IGNORECASE)
+    if m2:
+        raw = m2.group(1).replace(",", "")
+        try:
+            val = float(raw)
+            if val > 100:
+                return val
+        except ValueError:
+            pass
+    return None
+
+
+def _extract_amount_general(body: str) -> float | None:
+    """Parser amount untuk Bank Jago dan Sinarmas."""
+    # Hapus card number dulu (pola: digit-bintang-digit)
+    body_clean = re.sub(r'\d{4,6}\*+\d{4}', '', body)
+    for pat in [
+        r"(?:sebesar|jumlah|nominal|amount)[:\s]+Rp\.?\s*([\d\.]+)",
+        r"Rp\.?\s*([\d\.]+(?:,\d{2})?)",
+        r"IDR\s*([\d,]+(?:\.\d{1,2})?)",
+    ]:
+        m = re.search(pat, body_clean, re.IGNORECASE)
         if m:
             raw = m.group(1).replace(".", "").replace(",", "")
             try:
@@ -357,46 +486,314 @@ def _extract_amount(text: str):
     return None
 
 
+def _detect_tx_type_jenius_cc(subject: str, body: str) -> str:
+    """
+    Klasifikasi email Jenius CC:
+
+    TRANSFER  : bayar tagihan CC (perpindahan internal, bukan pengeluaran baru)
+                Subject 'You Just Paid Your Jenius Credit Card Bills'
+                -> dicatat Transfer agar tidak double-count dg transaksi CC asli
+
+    INCOME    : refund / cashback / reversal ke CC
+
+    EXPENSE   : semua transaksi belanja di merchant
+    """
+    subj = subject.lower()
+    text = (subject + " " + body).lower()
+
+    # TRANSFER: bayar tagihan CC
+    bill_payment_kw = [
+        "you just paid your jenius credit card",
+        "paid your jenius credit card bills",
+        "credit card bill has been received",
+        "pembayaran tagihan kartu kredit",
+    ]
+    if any(k in text for k in bill_payment_kw):
+        return "Transfer"
+
+    # INCOME: refund / cashback / reversal
+    income_kw = ["refund", "cashback", "reversal", "pembayaran tagihan diterima"]
+    if any(k in text for k in income_kw):
+        return "Income"
+
+    # EXPENSE: transaksi belanja di merchant
+    return "Expense"
+
+
+def _detect_tx_type_general(subject: str, body: str, pocket: str) -> str:
+    """Deteksi tipe transaksi untuk Bank Jago dan Sinarmas."""
+    text = (subject + " " + body).lower()
+    subj = subject.lower()
+
+    # Bank Jago: deteksi dari subject yang sangat spesifik
+    if "melakukan transfer" in subj or "kamu telah melakukan" in subj:
+        return "Expense"
+    if "menerima transfer" in subj or "dana masuk" in subj or "uang masuk" in subj:
+        return "Income"
+    if "pembayaran berhasil" in subj or "tagihan berhasil" in subj:
+        return "Expense"
+    if "top up berhasil" in subj:
+        return "Income"
+
+    income_kw = [
+        "transfer masuk", "incoming transfer", "menerima transfer",
+        "dana masuk", "kredit masuk", "credit received",
+        "refund", "cashback", "bunga tabungan", "dividen",
+    ]
+    expense_kw = [
+        "transfer keluar", "melakukan transfer", "debit", "pembayaran",
+        "payment", "belanja", "withdraw", "tarik tunai", "purchase",
+        "transaksi", "qris", "transfer out", "tagihan", "cicilan",
+    ]
+    if any(k in text for k in income_kw):
+        return "Income"
+    if any(k in text for k in expense_kw):
+        return "Expense"
+    return "Expense"
+
+
+def _extract_amount_jago(body: str) -> float | None:
+    """
+    Parser amount khusus Bank Jago.
+    Format: 'Jumlah      Rp30.000' (titik = pemisah ribuan, BUKAN desimal)
+    """
+    # Cari pola spesifik Jago: 'Jumlah' diikuti nominal
+    m = re.search(r"Jumlah\s+Rp([\d\.]+)", body)
+    if m:
+        raw = m.group(1).replace(".", "")  # Rp30.000 → 30000
+        try:
+            val = float(raw)
+            if val > 100:
+                return val
+        except ValueError:
+            pass
+    # Fallback: Rp dengan format titik ribuan
+    m2 = re.search(r"Rp\s*([\d\.]+)", body)
+    if m2:
+        raw = m2.group(1).replace(".", "")
+        try:
+            val = float(raw)
+            if val > 100:
+                return val
+        except ValueError:
+            pass
+    return None
+
+
+def _extract_description_jago(body: str, subject: str) -> str:
+    """
+    Ekstrak deskripsi dari email Bank Jago.
+    Format: field 'Ke' berisi nama penerima + baris berikutnya berisi nama bank.
+    Hasil: 'Transfer ke AHMAD MUSTAQFIRIN - Bank Sinarmas'
+    """
+    lines = [l.strip() for l in body.splitlines() if l.strip()]
+    subj  = subject.lower()
+
+    if "melakukan transfer" in subj:
+        # Cari nama penerima dari field 'Ke'
+        for i, line in enumerate(lines):
+            if re.match(r"^Ke\s+", line, re.IGNORECASE):
+                nama = re.sub(r"^Ke\s+", "", line, flags=re.IGNORECASE).strip()
+                # Baris berikutnya kemungkinan nama bank
+                bank_info = ""
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1]
+                    if re.search(r"Bank\s+\w+", nxt, re.IGNORECASE):
+                        bank_part = re.search(r"(Bank\s+\w+)", nxt, re.IGNORECASE)
+                        if bank_part:
+                            bank_info = f" - {bank_part.group(1)}"
+                if nama:
+                    return f"Transfer ke {nama}{bank_info}"[:50]
+
+    if "menerima transfer" in subj or "dana masuk" in subj:
+        # Cari pengirim dari field 'Dari'
+        for line in lines:
+            if re.match(r"^Dari\s+", line, re.IGNORECASE):
+                pengirim = re.sub(r"^Dari\s+", "", line, flags=re.IGNORECASE).strip()
+                # Hapus kode rekening (DC • 1066...)
+                pengirim = re.sub(r"DC\s*[•\-]\s*\d+", "", pengirim).strip()
+                if pengirim:
+                    return f"Transfer dari {pengirim}"[:50]
+
+    return subject[:40] if subject else "Bank Jago Transaction"
+
+
+def _extract_date_jago(body: str) -> str | None:
+    """Parse tanggal dari email Bank Jago. Format: '05 June 2026 07:34 WIB'"""
+    m = re.search(r"Tanggal transaksi\s+(\d{1,2}\s+\w+\s+\d{4})", body, re.IGNORECASE)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%d %B %Y").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return None
+
+
 def parse_bank_email(subject: str, body: str, email_date: str, sender: str) -> dict | None:
     try:
-        tx_date  = _parse_email_date(email_date)
-        text_all = (subject + " " + body).lower()
-        full_text = subject + " " + body
+        tx_date = _parse_email_date(email_date)
 
-        if "jago" in sender:
-            pocket = "Bank Jago"
-        elif "jenius" in sender or "btpn" in sender:
-            pocket = "Jenius"
-        elif "sinarmas" in sender:
+        is_jenius_cc = "jenius" in sender or "btpn" in sender or "smbci" in sender
+        is_jago      = "jago" in sender
+        is_sinarmas  = "sinarmas" in sender
+
+        if is_jenius_cc:
+            pocket  = "Jenius CC"
+            tx_type = _detect_tx_type_jenius_cc(subject, body)
+
+            if tx_type == "Transfer":
+                # ── Bayar tagihan CC ─────────────────────────────────────
+                # Amount: 'Payment in the amount of IDR3,000,000'
+                m_amt = re.search(r"amount of IDR\s*([\d,]+)", body, re.IGNORECASE)
+                if m_amt:
+                    try:
+                        amount = float(m_amt.group(1).replace(",", ""))
+                    except ValueError:
+                        amount = _extract_amount_jenius_cc(body)
+                else:
+                    amount = _extract_amount_jenius_cc(body)
+                description = "Bayar tagihan Jenius CC"
+                # Tanggal dari email header (tidak ada di body email ini)
+                # tx_date sudah di-set dari _parse_email_date di atas
+
+            else:
+                # ── Transaksi belanja di merchant ─────────────────────────
+                amount      = _extract_amount_jenius_cc(body)
+                description = subject[:40]
+                # Merchant dari body: 'Merchant: YOSHINOYA BDR SEPINGGAN R'
+                m = re.search(r"Merchant[:\s]+([^\r\n]{3,40})", body, re.IGNORECASE)
+                if m:
+                    desc_c = m.group(1).strip()
+                    if len(desc_c) > 3 and not re.match(r"^\d+$", desc_c):
+                        description = desc_c[:40]
+                # Tanggal dari body: 'Transaction date & time: 01/06/2026 16:09:44'
+                m_d = re.search(r"Transaction date[^:]*[:\s]+(\d{2}/\d{2}/\d{4})", body, re.IGNORECASE)
+                if m_d:
+                    try:
+                        tx_date = datetime.strptime(m_d.group(1), "%d/%m/%Y").strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
+
+        elif is_jago:
+            pocket      = "Bank Jago"
+            amount      = _extract_amount_jago(body)
+            tx_type     = _detect_tx_type_general(subject, body, pocket)
+            description = _extract_description_jago(body, subject)
+            date_jago   = _extract_date_jago(body)
+            if date_jago:
+                tx_date = date_jago
+
+        elif is_sinarmas:
             pocket = "Sinarmas"
+
+            # ── Deteksi format email Sinarmas ─────────────────────────────
+            # Format A: noreply.care@banksinarmas.com (Email Notifikasi)
+            #   Field: Tanggal, Nilai Transaksi, Jenis Transaksi, Nomor Referensi
+            #   Jenis Transaksi: "BI Fast Payment Cr" (Cr=Income) / "Db" (Expense)
+            # Format B: transaction@banksinarmas.com (Simobi+ Transfer)
+            #   Field: Transaction ID, Transaction date, From, Paid to, Amount
+
+            is_format_b = (
+                "transaction@banksinarmas" in sender or
+                "transfer successful" in body.lower() or
+                "paid to" in body.lower()
+            )
+
+            if is_format_b:
+                # ── Format B: Simobi+ Transfer Successful ─────────────────
+                # Selalu Expense (transfer keluar dari rekening Sinta)
+                tx_type = "Expense"
+
+                # Amount: 'Amount    Rp450.000' atau 'Total payment    Rp450.000'
+                # Ambil 'Amount' bukan 'Admin fee' yang selalu kecil
+                m_amt = re.search(r"(?:^|\n)\s*Amount\s+Rp([\d\.]+)", body, re.IGNORECASE | re.MULTILINE)
+                if not m_amt:
+                    m_amt = re.search(r"Total payment\s+Rp([\d\.]+)", body, re.IGNORECASE)
+                amount = None
+                if m_amt:
+                    raw = m_amt.group(1).replace(".", "")
+                    try:
+                        amount = float(raw)
+                    except ValueError:
+                        pass
+                if not amount:
+                    amount = _extract_amount_general(body)
+
+                # Deskripsi: ambil nama penerima dari field 'Paid to'
+                m_to = re.search(r"Paid to\s+([A-Z][^\n\r]+)", body, re.IGNORECASE)
+                if m_to:
+                    penerima = m_to.group(1).strip()
+                    # Bersihkan nama bank di baris berikutnya jika ada
+                    penerima = re.split(r"\s*-\s*BANK\s", penerima)[0].strip()
+                    description = f"Transfer ke {penerima}"[:50]
+                else:
+                    description = subject[:40]
+
+                # Tanggal: 'Transaction date    04 Jun 2026 16:11:26 WIB'
+                m_d = re.search(
+                    r"Transaction date\s+(\d{2}\s+\w+\s+\d{4})",
+                    body, re.IGNORECASE
+                )
+                if m_d:
+                    for fmt in ["%d %b %Y", "%d %B %Y"]:
+                        try:
+                            tx_date = datetime.strptime(m_d.group(1), fmt).strftime("%Y-%m-%d")
+                            break
+                        except ValueError:
+                            continue
+
+            else:
+                # ── Format A: Email Notifikasi (noreply.care) ─────────────
+                # Deteksi Income/Expense dari field 'Jenis Transaksi'
+                # Cr  = Credit  = Income (uang masuk)
+                # Db  = Debit   = Expense (uang keluar)
+                jenis_m = re.search(r"Jenis Transaksi\s+[:\-]?\s*(.+)", body, re.IGNORECASE)
+                if jenis_m:
+                    jenis = jenis_m.group(1).strip().lower()
+                    if jenis.endswith(" cr") or " cr " in jenis or jenis == "cr":
+                        tx_type = "Income"
+                    elif jenis.endswith(" db") or " db " in jenis or jenis == "db":
+                        tx_type = "Expense"
+                    else:
+                        tx_type = _detect_tx_type_general(subject, body, pocket)
+                else:
+                    tx_type = _detect_tx_type_general(subject, body, pocket)
+
+                # Amount: 'Nilai Transaksi    : IDR 11,720,000.00'
+                m_amt = re.search(r"Nilai Transaksi\s*[:\-]?\s*IDR\s*([\d,]+(?:\.\d{1,2})?)", body, re.IGNORECASE)
+                amount = None
+                if m_amt:
+                    raw = m_amt.group(1).replace(",", "")
+                    try:
+                        amount = float(raw)
+                    except ValueError:
+                        pass
+                if not amount:
+                    amount = _extract_amount_general(body)
+
+                # Deskripsi: ambil Jenis Transaksi sebagai deskripsi
+                if jenis_m:
+                    jenis_full = jenis_m.group(1).strip()
+                    description = f"Sinarmas - {jenis_full}"[:50]
+                else:
+                    description = subject[:40]
+
+                # Tanggal: 'Tanggal    : 25-05-2026'
+                m_d = re.search(r"Tanggal\s*[:\-]?\s*(\d{2}[-/]\d{2}[-/]\d{4})", body, re.IGNORECASE)
+                if m_d:
+                    raw_d = m_d.group(1).replace("-", "/")
+                    try:
+                        tx_date = datetime.strptime(raw_d, "%d/%m/%Y").strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
         else:
-            pocket = "Email"
+            pocket      = "Email"
+            amount      = _extract_amount_general(body)
+            tx_type     = _detect_tx_type_general(subject, body, pocket)
+            description = subject[:40]
 
-        debit_kw  = ["debit", "keluar", "pembayaran", "payment", "transfer out",
-                     "belanja", "withdraw", "tarik", "purchase", "transaksi debet"]
-        credit_kw = ["kredit", "masuk", "incoming", "top up", "credit", "terima",
-                     "receive", "transfer in", "transaksi kredit"]
-
-        if any(k in text_all for k in credit_kw):
-            tx_type = "Income"
-        elif any(k in text_all for k in debit_kw):
-            tx_type = "Expense"
-        else:
-            tx_type = "Expense"
-
-        amount = _extract_amount(full_text)
         if not amount:
             return None
-
-        description = subject[:40] if subject else f"{pocket} Transaction"
-        for pat in [
-            r"(?:merchant|toko|at|to|ke|dari|untuk)[:\s]+([^\n\r,]{3,40})",
-            r"(?:transaksi di|pembelian di)[:\s]+([^\n\r,]{3,40})",
-        ]:
-            m = re.search(pat, body, re.IGNORECASE)
-            if m:
-                description = m.group(1).strip()[:40]
-                break
 
         return {
             "date": tx_date, "description": description, "amount": amount,
@@ -406,6 +803,7 @@ def parse_bank_email(subject: str, body: str, email_date: str, sender: str) -> d
         }
     except Exception:
         return None
+
 
 
 def fetch_email_transactions(email_addr: str, app_password: str,
@@ -983,6 +1381,197 @@ def tab_validation(df_all: pd.DataFrame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9B — UI: POCKET BALANCE & NET WORTH
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tab_pocket_balance(df_all: pd.DataFrame):
+    st.title("💼 Saldo & Net Worth")
+    st.caption(
+        "Pantau saldo aktual per kantong. "
+        "Input saldo manual untuk sinkronisasi dengan rekening nyata."
+    )
+
+    pb_df = load_pocket_balances()
+
+    # ── Penjelasan logika CC ──────────────────────────────────────────────────
+    with st.expander("ℹ️ Cara kerja pencatatan Jenius CC (penting dibaca)", expanded=False):
+        st.markdown("""
+        **Prinsip yang dipakai (Pendekatan A — Track per Transaksi):**
+
+        | Email | Dicatat sebagai | Alasan |
+        |---|---|---|
+        | Belanja Yoshinoya Rp 154rb | ✅ **Expense** | Pengeluaran nyata per kategori |
+        | Belanja Grab Rp 50rb | ✅ **Expense** | Pengeluaran nyata per kategori |
+        | Bayar tagihan CC Rp 3jt | ✅ **Transfer** | Perpindahan uang, BUKAN pengeluaran baru |
+
+        **Kenapa bayar tagihan CC = Transfer?**
+        Karena belanja individual sudah tercatat sebagai Expense.
+        Kalau bayar tagihan juga Expense → double count (tercatat 2x).
+
+        **Cara cek balance CC:**
+        Total hutang CC = Total Expense di Jenius CC - Total Transfer masuk ke CC
+
+        **Input saldo manual** di bawah untuk sinkronisasi dengan saldo rekening nyata.
+        """)
+
+    st.divider()
+
+    # ── KPI Net Worth ─────────────────────────────────────────────────────────
+    bank_total = pb_df[pb_df["is_cc"] == False]["balance"].sum()
+    cc_total   = pb_df[pb_df["is_cc"] == True]["balance"].sum()
+    net_worth  = bank_total - cc_total
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("🏦 Total Saldo Bank", fmt_idr(bank_total))
+    k2.metric("💳 Total Hutang CC",  fmt_idr(cc_total),
+              delta=f"Rp {cc_total:,.0f}".replace(",", ".") + " hutang",
+              delta_color="inverse" if cc_total > 0 else "normal")
+    k3.metric("💰 Net Worth (Bank - CC)", fmt_idr(net_worth),
+              delta_color="normal" if net_worth >= 0 else "inverse")
+    st.divider()
+
+    # ── Tabel saldo per pocket ────────────────────────────────────────────────
+    st.markdown("### 💳 Saldo per Kantong")
+    st.caption("Update saldo manual setiap bulan atau setelah sinkronisasi email.")
+
+    tab_bank, tab_cc = st.tabs(["🏦 Rekening Bank", "💳 Kartu Kredit (CC)"])
+
+    with tab_bank:
+        bank_df = pb_df[pb_df["is_cc"] == False].copy()
+        if bank_df.empty:
+            st.info("Belum ada rekening bank terdaftar.")
+        else:
+            for _, row in bank_df.iterrows():
+                with st.container(border=True):
+                    col_name, col_bal, col_btn = st.columns([2, 3, 1])
+                    col_name.markdown(f"**{row['pocket_name']}**")
+                    col_name.caption(f"Tipe: {row['pocket_type'].upper()}")
+
+                    new_bal = col_bal.number_input(
+                        "Saldo saat ini (IDR)",
+                        value=float(row["balance"]),
+                        min_value=0.0, step=10_000.0,
+                        key=f"bal_{row['pocket_name']}",
+                        format="%0.0f",
+                    )
+                    if col_btn.button("💾 Simpan", key=f"sbtn_{row['pocket_name']}", use_container_width=True):
+                        update_pocket_balance(row["pocket_name"], new_bal)
+                        st.success(f"✅ Saldo {row['pocket_name']} diperbarui!")
+                        st.rerun()
+
+                    # Analisis dari transaksi
+                    if not df_all.empty:
+                        df_p  = df_all[df_all["pocket"] == row["pocket_name"]]
+                        total_in  = df_p[df_p["type"] == "Income"]["amount"].sum()
+                        total_out = df_p[df_p["type"] == "Expense"]["amount"].sum()
+                        total_tf  = df_p[df_p["type"] == "Transfer"]["amount"].sum()
+                        col_bal.caption(
+                            f"Dari transaksi: Masuk {fmt_idr(total_in)} | "
+                            f"Keluar {fmt_idr(total_out)} | "
+                            f"Transfer {fmt_idr(total_tf)}"
+                        )
+
+        st.divider()
+        st.markdown("#### ➕ Tambah Rekening Bank")
+        with st.form("add_bank_pocket", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            new_pname  = c1.text_input("Nama Rekening", placeholder="e.g. BCA Tabungan")
+            new_ptype  = c2.selectbox("Tipe", ["bank", "e-wallet", "cash", "investasi"])
+            new_pbal   = c3.number_input("Saldo Awal (IDR)", min_value=0.0, step=10_000.0)
+            if st.form_submit_button("➕ Tambah", type="primary"):
+                if new_pname:
+                    add_pocket(new_pname, new_ptype, False, new_pbal)
+                    st.success(f"✅ {new_pname} ditambahkan!")
+                    st.rerun()
+
+    with tab_cc:
+        cc_df = pb_df[pb_df["is_cc"] == True].copy()
+        if cc_df.empty:
+            st.info("Belum ada kartu kredit terdaftar.")
+        else:
+            for _, row in cc_df.iterrows():
+                with st.container(border=True):
+                    col_name, col_bal, col_btn = st.columns([2, 3, 1])
+                    col_name.markdown(f"**{row['pocket_name']}** 💳")
+                    col_name.caption("Kartu Kredit — input tagihan outstanding")
+
+                    new_bal = col_bal.number_input(
+                        "Tagihan outstanding saat ini (IDR)",
+                        value=float(row["balance"]),
+                        min_value=0.0, step=10_000.0,
+                        key=f"cc_bal_{row['pocket_name']}",
+                        format="%0.0f",
+                        help="Isi dengan total tagihan CC yang belum dibayar",
+                    )
+                    if col_btn.button("💾 Simpan", key=f"ccbtn_{row['pocket_name']}", use_container_width=True):
+                        update_pocket_balance(row["pocket_name"], new_bal)
+                        st.success(f"✅ Tagihan {row['pocket_name']} diperbarui!")
+                        st.rerun()
+
+                    # Analisis hutang CC dari transaksi
+                    if not df_all.empty:
+                        df_cc    = df_all[df_all["pocket"] == row["pocket_name"]]
+                        cc_spend = df_cc[df_cc["type"] == "Expense"]["amount"].sum()
+                        cc_paid  = df_all[
+                            (df_all["type"] == "Transfer") &
+                            (df_all["description"].str.contains("tagihan jenius", case=False, na=False))
+                        ]["amount"].sum()
+                        col_bal.caption(
+                            f"Total belanja CC: {fmt_idr(cc_spend)} | "
+                            f"Total sudah dibayar: {fmt_idr(cc_paid)} | "
+                            f"Estimasi hutang: {fmt_idr(max(0, cc_spend - cc_paid))}"
+                        )
+
+        st.divider()
+        st.markdown("#### ➕ Tambah Kartu Kredit")
+        with st.form("add_cc_pocket", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            new_ccname = c1.text_input("Nama CC", placeholder="e.g. BCA Credit Card")
+            new_ccbal  = c2.number_input("Tagihan outstanding (IDR)", min_value=0.0, step=10_000.0)
+            if st.form_submit_button("➕ Tambah", type="primary"):
+                if new_ccname:
+                    add_pocket(new_ccname, "cc", True, new_ccbal)
+                    st.success(f"✅ {new_ccname} ditambahkan!")
+                    st.rerun()
+
+    st.divider()
+
+    # ── Rekonsiliasi: saldo buku vs saldo manual ──────────────────────────────
+    st.markdown("### 🔍 Rekonsiliasi Saldo")
+    st.caption("Bandingkan saldo dari transaksi tercatat vs saldo manual yang kamu input.")
+
+    if df_all.empty:
+        st.info("Belum ada data transaksi.")
+        return
+
+    recon_rows = []
+    for _, row in pb_df.iterrows():
+        df_p     = df_all[df_all["pocket"] == row["pocket_name"]]
+        total_in  = df_p[df_p["type"] == "Income"]["amount"].sum()
+        total_out = df_p[df_p["type"] == "Expense"]["amount"].sum()
+        total_tf  = df_p[df_p["type"] == "Transfer"]["amount"].sum()
+        net_from_tx = total_in - total_out - total_tf
+        manual_bal  = row["balance"]
+        selisih     = manual_bal - net_from_tx
+
+        recon_rows.append({
+            "Kantong":            row["pocket_name"],
+            "Tipe":               "CC 💳" if row["is_cc"] else "Bank 🏦",
+            "Saldo Manual (IDR)": fmt_idr(manual_bal),
+            "Net dari Transaksi": fmt_idr(net_from_tx),
+            "Selisih":            fmt_idr(abs(selisih)),
+            "Status":             "✅ Match" if abs(selisih) < 1000
+                                  else f"⚠️ {'Over' if selisih > 0 else 'Under'} Rp {abs(selisih):,.0f}".replace(",", "."),
+        })
+
+    st.dataframe(pd.DataFrame(recon_rows), use_container_width=True, hide_index=True)
+    st.caption(
+        "Selisih wajar terjadi karena: transaksi tunai tidak tercatat via email, "
+        "atau ada transaksi di luar periode sinkronisasi."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SECTION 9 — UI: MASTER DATA MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1266,8 +1855,8 @@ def main():
 
     nav = st.sidebar.radio(
         "Navigasi Utama",
-        ["📊 Dashboard", "🎯 Budget vs Actual", "🗂️ Master Data",
-         "📧 Email Sync", "⚙️ Validasi Antrean", "📥 Ingestion Data"],
+        ["📊 Dashboard", "🎯 Budget vs Actual", "💼 Saldo & Net Worth",
+         "🗂️ Master Data", "📧 Email Sync", "⚙️ Validasi Antrean", "📥 Ingestion Data"],
         key="current_nav",
     )
 
@@ -1277,6 +1866,8 @@ def main():
         tab_dashboard(df_all)
     elif nav == "🎯 Budget vs Actual":
         tab_budget_vs_actual(df_all)
+    elif nav == "💼 Saldo & Net Worth":
+        tab_pocket_balance(df_all)
     elif nav == "🗂️ Master Data":
         tab_master_data()
     elif nav == "📧 Email Sync":
