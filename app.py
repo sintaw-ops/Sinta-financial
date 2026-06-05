@@ -1206,14 +1206,15 @@ def tab_validation(df_all: pd.DataFrame):
                 # Tabel per-baris dengan selectbox inline
                 st.markdown("**Atau assign per baris:**")
 
-                # Header
-                h1, h2, h3, h4, h5, h6 = st.columns([1.2, 3, 1.5, 1.2, 2.5, 1])
+                # Header — tambah kolom Pocket
+                h1, h2, h3, h4, h5, h6, h7 = st.columns([1.1, 2.5, 1.3, 1.0, 1.1, 2.2, 0.8])
                 h1.markdown("**Tanggal**")
                 h2.markdown("**Deskripsi**")
                 h3.markdown("**Jumlah**")
                 h4.markdown("**Tipe**")
-                h5.markdown("**Sub-Kategori**")
-                h6.markdown("**Aksi**")
+                h5.markdown("**Sumber**")
+                h6.markdown("**Sub-Kategori**")
+                h7.markdown("**Aksi**")
                 st.divider()
 
                 # Simpan state pilihan per baris
@@ -1222,38 +1223,77 @@ def tab_validation(df_all: pd.DataFrame):
 
                 pending_saves = []
 
+                # Warna pocket badge
+                POCKET_COLORS = {
+                    "Bank Jago":  ("#f39c12", "#fff8ed"),
+                    "Jenius CC":  ("#3498db", "#eef6fd"),
+                    "Sinarmas":   ("#e74c3c", "#fef0ef"),
+                    "Email":      ("#9b59b6", "#f5f0fb"),
+                }
+
                 for _, row in filtered.iterrows():
-                    tid = int(row["id"])
+                    tid     = int(row["id"])
                     tx_type = row["type"]
+                    pocket  = str(row.get("pocket", "") or "")
                     sub_list = (sub_opts_exp if tx_type == "Expense"
                                 else sub_opts_inc if tx_type == "Income"
                                 else sub_opts_tra)
 
-                    c1, c2, c3, c4, c5, c6 = st.columns([1.2, 3, 1.5, 1.2, 2.5, 1])
-                    c1.markdown(f"<small>{str(row['date'])[:10]}</small>", unsafe_allow_html=True)
-                    c2.markdown(f"<small>{row['description'][:35]}</small>", unsafe_allow_html=True)
+                    c1, c2, c3, c4, c5, c6, c7 = st.columns([1.1, 2.5, 1.3, 1.0, 1.1, 2.2, 0.8])
 
-                    # Warna amount berdasarkan tipe
+                    # Tanggal
+                    c1.markdown(
+                        f"<small>{str(row['date'])[:10]}</small>",
+                        unsafe_allow_html=True
+                    )
+
+                    # Deskripsi
+                    c2.markdown(
+                        f"<small title='{row['description']}'>{row['description'][:32]}"
+                        f"{'…' if len(row['description']) > 32 else ''}</small>",
+                        unsafe_allow_html=True
+                    )
+
+                    # Jumlah dengan warna
                     amt_color = "#2ecc71" if tx_type == "Income" else "#e74c3c" if tx_type == "Expense" else "#f39c12"
-                    prefix = "+" if tx_type == "Income" else "-" if tx_type == "Expense" else "→"
-                    c3.markdown(f"<small style='color:{amt_color};font-weight:500'>{prefix}{fmt_idr(row['amount'])}</small>", unsafe_allow_html=True)
+                    prefix    = "+" if tx_type == "Income" else "-" if tx_type == "Expense" else "→"
+                    c3.markdown(
+                        f"<small style='color:{amt_color};font-weight:500'>"
+                        f"{prefix}{fmt_idr(row['amount'])}</small>",
+                        unsafe_allow_html=True
+                    )
 
                     # Badge tipe
                     badge_color = {"Income": "#2ecc71", "Expense": "#e74c3c", "Transfer": "#f39c12"}.get(tx_type, "#888")
-                    c4.markdown(f"<small><span style='background:{badge_color}22;color:{badge_color};padding:2px 6px;border-radius:4px;font-size:11px'>{tx_type}</span></small>", unsafe_allow_html=True)
+                    c4.markdown(
+                        f"<small><span style='background:{badge_color}22;color:{badge_color};"
+                        f"padding:2px 5px;border-radius:4px;font-size:10px'>{tx_type}</span></small>",
+                        unsafe_allow_html=True
+                    )
+
+                    # Badge pocket/sumber bank
+                    p_fg, p_bg = POCKET_COLORS.get(pocket, ("#555", "#f0f0f0"))
+                    pocket_label = pocket[:10] if pocket else "—"
+                    c5.markdown(
+                        f"<small><span style='background:{p_bg};color:{p_fg};"
+                        f"padding:2px 5px;border-radius:4px;font-size:10px;"
+                        f"border:1px solid {p_fg}33;white-space:nowrap'>"
+                        f"{pocket_label}</span></small>",
+                        unsafe_allow_html=True
+                    )
 
                     # Selectbox kategori
-                    sel = c5.selectbox(
+                    sel = c6.selectbox(
                         "kat", sub_list, key=f"sel_{tid}",
                         label_visibility="collapsed",
                     )
                     st.session_state.bulk_selections[tid] = (sel, tx_type)
 
                     # Tombol simpan per baris
-                    if c6.button("💾", key=f"save_{tid}", help="Simpan"):
+                    if c7.button("💾", key=f"save_{tid}", help="Simpan"):
                         pending_saves.append((sel, tx_type, tid))
 
-                    st.markdown("<hr style='margin:2px 0;opacity:0.2'>", unsafe_allow_html=True)
+                    st.markdown("<hr style='margin:2px 0;opacity:0.15'>", unsafe_allow_html=True)
 
                 # Proses simpan per-baris
                 if pending_saves:
