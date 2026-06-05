@@ -878,7 +878,7 @@ def main():
 
     nav_selection = st.sidebar.radio(
         "Navigasi Utama",
-        ["📊 Dashboard", "🎯 Budget vs Actual", "🗂️ Master Data", "⚙️ Validasi Antrean", "📥 Ingestion Data"],
+        ["📊 Dashboard", "🎯 Budget vs Actual", "🗂️ Master Data", "📧 Email Sync", "⚙️ Validasi Antrean", "📥 Ingestion Data"],
         key="current_nav",
     )
 
@@ -890,6 +890,8 @@ def main():
         tab_budget_vs_actual(df_all)
     elif nav_selection == "🗂️ Master Data":
         tab_master_data()
+    elif nav_selection == "📧 Email Sync":
+        tab_email_sync()
     elif nav_selection == "📥 Ingestion Data":
         tab_ingestion()
     elif nav_selection == "⚙️ Validasi Antrean":
@@ -898,3 +900,140 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 11 — UI: EMAIL SYNC (NEW)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tab_email_sync():
+    """
+    Tab untuk tarik data transaksi dari email notifikasi bank via Gmail IMAP.
+    Menggunakan Gmail App Password (bukan password akun utama).
+    """
+    st.title("📧 Sinkronisasi Email Bank")
+    st.caption(
+        "Tarik otomatis transaksi dari email notifikasi Bank Jago, Jenius, dan Sinarmas. "
+        "Menggunakan Gmail IMAP — aman, tidak menyimpan password di server."
+    )
+
+    # ── Panduan Setup ─────────────────────────────────────────────────────────
+    with st.expander("ℹ️ Cara Setup Gmail App Password (klik untuk baca)", expanded=False):
+        st.markdown("""
+        **Langkah 1:** Aktifkan 2-Factor Authentication di akun Google kamu.
+
+        **Langkah 2:** Buka [https://myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+
+        **Langkah 3:** Pilih app = **Mail**, device = **Other** → beri nama "CFO Console"
+
+        **Langkah 4:** Salin 16-karakter App Password yang muncul (format: xxxx xxxx xxxx xxxx)
+
+        **Langkah 5:** Masukkan App Password tersebut di form di bawah (tanpa spasi).
+
+        > ⚠️ App Password berbeda dari password Gmail biasa. Password Gmail kamu tetap aman.
+        """)
+
+    st.divider()
+
+    # ── Form Koneksi ──────────────────────────────────────────────────────────
+    with st.container(border=True):
+        st.markdown("#### 🔐 Konfigurasi Koneksi Gmail")
+
+        # Cek apakah credentials sudah tersimpan di secrets
+        has_secrets = (
+            "GMAIL_EMAIL" in st.secrets and
+            "GMAIL_APP_PASSWORD" in st.secrets
+        )
+
+        if has_secrets:
+            st.success("✅ Kredensial Gmail terdeteksi dari Streamlit Secrets.")
+            email_addr   = st.secrets["GMAIL_EMAIL"]
+            app_password = st.secrets["GMAIL_APP_PASSWORD"]
+            st.info(f"Akun terhubung: **{email_addr}**")
+        else:
+            st.info(
+                "💡 Tip: Untuk keamanan lebih baik, simpan kredensial di "
+                "**Streamlit Secrets** (Settings → Secrets) dengan key "
+                "`GMAIL_EMAIL` dan `GMAIL_APP_PASSWORD`."
+            )
+            col1, col2 = st.columns(2)
+            email_addr   = col1.text_input("Gmail Address", placeholder="sinta@gmail.com")
+            app_password = col2.text_input("App Password (16 karakter)", type="password",
+                                           placeholder="xxxxxxxxxxxxxxxxxxxx")
+
+        days_back = st.slider(
+            "Rentang waktu cek email (hari ke belakang)",
+            min_value=1, max_value=30, value=7,
+        )
+
+    st.divider()
+
+    # ── Tombol Refresh / Cek Email ────────────────────────────────────────────
+    col_btn1, col_btn2, _ = st.columns([1, 1, 3])
+
+    do_fetch  = col_btn1.button("🔄 Cek Email Sekarang", type="primary", use_container_width=True)
+    do_preview = col_btn2.button("👁️ Preview Saja (tanpa simpan)", use_container_width=True)
+
+    if do_fetch or do_preview:
+        if not email_addr or not app_password:
+            st.warning("Masukkan Gmail address dan App Password terlebih dahulu.")
+            st.stop()
+
+        with st.spinner(f"Menghubungkan ke Gmail dan membaca email {days_back} hari terakhir..."):
+            from email_parser import fetch_and_parse_transactions
+            txs, raw_emails, err = fetch_and_parse_transactions(
+                email_addr, app_password, days_back=days_back
+            )
+
+        # ── Tampilkan hasil ───────────────────────────────────────────────────
+        if err:
+            st.error(f"⚠️ Error sebagian: {err}")
+
+        st.markdown(f"**📬 Email bank ditemukan:** {len(raw_emails)} email")
+        st.markdown(f"**💳 Transaksi berhasil di-parse:** {len(txs)} transaksi")
+
+        if not txs:
+            st.warning(
+                "Tidak ada transaksi yang berhasil di-parse. "
+                "Kemungkinan: tidak ada email bank masuk, atau format email belum didukung."
+            )
+            if raw_emails:
+                with st.expander("📋 Raw email yang ditemukan (debug)"):
+                    for em in raw_emails[:5]:
+                        st.text(f"From: {em['from']}")
+                        st.text(f"Subject: {em['subject']}")
+                        st.text(f"Date: {em['date']}")
+                        st.divider()
+        else:
+            import pandas as pd
+            df_preview = pd.DataFrame(txs)
+            display_cols = ["date", "description", "amount", "type", "pocket", "bank_detected"]
+            display_cols = [c for c in display_cols if c in df_preview.columns]
+
+            st.markdown("#### 👀 Preview Transaksi")
+            st.dataframe(df_preview[display_cols], use_container_width=True, hide_index=True)
+
+            if do_fetch:
+                with st.spinner("Menyimpan ke database..."):
+                    inserted, skipped = save_transactions(df_preview)
+                st.success(f"✅ **{inserted}** transaksi baru disimpan, **{skipped}** dilewati (duplikat).")
+                if inserted > 0:
+                    st.info("💡 Pergi ke **Validasi Antrean** untuk mengkategorisasi transaksi baru.")
+            else:
+                st.info("Mode preview — transaksi belum disimpan. Klik 'Cek Email Sekarang' untuk simpan.")
+
+    # ── Status terakhir & histori email sync ─────────────────────────────────
+    st.divider()
+    st.markdown("#### 📊 Transaksi dari Email (tersimpan)")
+    df_all = load_all_transactions()
+    if not df_all.empty and "source" in df_all.columns:
+        email_txs = df_all[df_all.get("source", "") == "email"]
+        if not email_txs.empty:
+            st.dataframe(
+                email_txs[["date", "description", "amount", "type", "sub_category", "pocket"]],
+                use_container_width=True, height=250, hide_index=True,
+            )
+        else:
+            st.info("Belum ada transaksi yang diimport dari email.")
+    else:
+        st.info("Belum ada transaksi dari email. Gunakan tombol 'Cek Email Sekarang' di atas.")
