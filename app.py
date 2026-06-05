@@ -806,13 +806,33 @@ def parse_bank_email(subject: str, body: str, email_date: str, sender: str) -> d
 
 
 
-def fetch_email_transactions(email_addr: str, app_password: str,
-                              days_back: int = 7) -> tuple[list, list, str]:
+def fetch_email_transactions(
+    email_addr: str,
+    app_password: str,
+    days_back: int = 7,
+    date_from=None,
+    date_to=None,
+) -> tuple[list, list, str]:
+    """
+    Fetch & parse email transaksi bank dari Gmail via IMAP.
+    Post-filter ketat berdasarkan tanggal TRANSAKSI (bukan tanggal email)
+    agar hanya tx dalam range date_from..date_to yang dikembalikan.
+    """
     import imaplib
     import email as email_lib
+    import datetime as dt_mod
     from email.header import decode_header
 
     transactions, raw_emails, errors = [], [], []
+
+    today = datetime.now().date()
+    if date_from is None:
+        date_from = today - dt_mod.timedelta(days=days_back - 1)
+    if date_to is None:
+        date_to = today
+
+    # IMAP SINCE: 1 hari lebih awal untuk toleransi timezone server Gmail
+    imap_since = (date_from - dt_mod.timedelta(days=1)).strftime("%d-%b-%Y")
 
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
@@ -822,15 +842,13 @@ def fetch_email_transactions(email_addr: str, app_password: str,
 
     try:
         mail.select("INBOX")
-        since = (datetime.now() - __import__('datetime').timedelta(days=days_back)).strftime("%d-%b-%Y")
-
         for keyword in ["jago", "btpn", "jenius", "sinarmas"]:
             try:
-                _, ids = mail.search(None, f'(SINCE "{since}" FROM "{keyword}")')
+                _, ids = mail.search(None, f'(SINCE "{imap_since}" FROM "{keyword}")')
                 for msg_id in ids[0].split():
                     try:
                         _, data = mail.fetch(msg_id, "(RFC822)")
-                        msg = email_lib.message_from_bytes(data[0][1])
+                        msg      = email_lib.message_from_bytes(data[0][1])
                         raw_s, enc = decode_header(msg["Subject"] or "")[0]
                         subject  = raw_s.decode(enc or "utf-8", errors="ignore") if isinstance(raw_s, bytes) else (raw_s or "")
                         sender   = msg.get("From", "").lower()
@@ -849,11 +867,19 @@ def fetch_email_transactions(email_addr: str, app_password: str,
                                 body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
                             except Exception:
                                 pass
-                        raw_emails.append({"subject": subject, "from": sender,
-                                           "date": date_str, "body": body[:500]})
+                        raw_emails.append({
+                            "subject": subject, "from": sender,
+                            "date": date_str, "body": body[:500],
+                        })
                         tx = parse_bank_email(subject, body, date_str, sender)
                         if tx:
-                            transactions.append(tx)
+                            # POST-FILTER ketat: hanya tanggal transaksi dalam range
+                            try:
+                                tx_date = dt_mod.date.fromisoformat(tx["date"])
+                                if date_from <= tx_date <= date_to:
+                                    transactions.append(tx)
+                            except (ValueError, KeyError):
+                                transactions.append(tx)
                     except Exception as e:
                         errors.append(f"msg {msg_id}: {e}")
             except Exception as e:
@@ -1876,7 +1902,10 @@ def tab_email_sync():
             st.stop()
 
         with st.spinner(f"Menghubungkan ke Gmail · {range_info}..."):
-            txs, raw_emails, err = fetch_email_transactions(email_addr, app_password, days_back)
+            txs, raw_emails, err = fetch_email_transactions(
+                email_addr, app_password, days_back,
+                date_from=date_from, date_to=date_to
+            )
 
         if err:
             st.error(f"⚠️ Error: {err}")
