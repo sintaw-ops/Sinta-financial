@@ -133,10 +133,14 @@ def init_db():
                 ('Sinarmas',   'bank', FALSE, 0)
             ON CONFLICT (pocket_name) DO NOTHING
         """)
-        # ── Migrasi: tambah kolom source jika belum ada ──────────────────────
+        # ── Migrasi: tambah kolom jika belum ada ────────────────────────────
         c.execute("""
             ALTER TABLE transactions
             ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual'
+        """)
+        c.execute("""
+            ALTER TABLE transactions
+            ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''
         """)
         c.execute("SELECT COUNT(*) FROM categories")
         if c.fetchone()[0] == 0:
@@ -187,6 +191,7 @@ def save_transactions(df: pd.DataFrame) -> tuple[int, int]:
         sub     = str(row.get("sub_category", "uncategorized")).strip()
         tx_type = str(row["type"])
         source  = str(row.get("source", "manual"))
+        notes   = str(row.get("notes", "")).strip()
         rows.append((
             str(row["date"])[:10],
             str(row["description"]),
@@ -196,6 +201,7 @@ def save_transactions(df: pd.DataFrame) -> tuple[int, int]:
             sub,
             str(row.get("pocket", "")),
             source,
+            notes,
         ))
     if not rows:
         return 0, 0
@@ -203,7 +209,7 @@ def save_transactions(df: pd.DataFrame) -> tuple[int, int]:
         execute_values(
             c,
             """INSERT INTO transactions
-               (date, description, amount, type, category, sub_category, pocket, source)
+               (date, description, amount, type, category, sub_category, pocket, source, notes)
                VALUES %s ON CONFLICT (date, description, amount) DO NOTHING""",
             rows,
         )
@@ -241,6 +247,31 @@ def delete_transaction(tid: int):
     conn = _conn()
     with conn.cursor() as c:
         c.execute("DELETE FROM transactions WHERE id = %s", (tid,))
+    conn.commit()
+    load_all_transactions.clear()
+
+
+def update_notes(tid: int, notes: str):
+    """Update field notes pada transaksi."""
+    conn = _conn()
+    with conn.cursor() as c:
+        c.execute(
+            "UPDATE transactions SET notes = %s WHERE id = %s",
+            (notes.strip(), tid)
+        )
+    conn.commit()
+    load_all_transactions.clear()
+
+
+def bulk_update_categories_and_notes(updates: list[tuple[str, str, str, int]]):
+    """Update sub_category + category + notes untuk banyak transaksi sekaligus."""
+    conn = _conn()
+    with conn.cursor() as c:
+        for new_sub, new_cat, notes, tid in updates:
+            c.execute(
+                "UPDATE transactions SET sub_category=%s, category=%s, notes=%s WHERE id=%s",
+                (new_sub, new_cat, notes.strip(), tid),
+            )
     conn.commit()
     load_all_transactions.clear()
 
@@ -1232,15 +1263,16 @@ def tab_validation(df_all: pd.DataFrame):
                 # Tabel per-baris dengan selectbox inline
                 st.markdown("**Atau assign per baris:**")
 
-                # Header — tambah kolom Pocket
-                h1, h2, h3, h4, h5, h6, h7 = st.columns([1.1, 2.5, 1.3, 1.0, 1.1, 2.2, 0.8])
+                # Header — Tanggal | Deskripsi | Jumlah | Tipe | Sumber | Sub-Kat | Notes | Aksi
+                h1, h2, h3, h4, h5, h6, h7, h8 = st.columns([1.0, 2.2, 1.2, 0.9, 1.0, 1.8, 1.8, 0.7])
                 h1.markdown("**Tanggal**")
                 h2.markdown("**Deskripsi**")
                 h3.markdown("**Jumlah**")
                 h4.markdown("**Tipe**")
                 h5.markdown("**Sumber**")
                 h6.markdown("**Sub-Kategori**")
-                h7.markdown("**Aksi**")
+                h7.markdown("**Notes** ✏️")
+                h8.markdown("**Aksi**")
                 st.divider()
 
                 # Simpan state pilihan per baris
@@ -1265,7 +1297,7 @@ def tab_validation(df_all: pd.DataFrame):
                                 else sub_opts_inc if tx_type == "Income"
                                 else sub_opts_tra)
 
-                    c1, c2, c3, c4, c5, c6, c7 = st.columns([1.1, 2.5, 1.3, 1.0, 1.1, 2.2, 0.8])
+                    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.0, 2.2, 1.2, 0.9, 1.0, 1.8, 1.8, 0.7])
 
                     # Tanggal
                     c1.markdown(
@@ -1275,8 +1307,8 @@ def tab_validation(df_all: pd.DataFrame):
 
                     # Deskripsi
                     c2.markdown(
-                        f"<small title='{row['description']}'>{row['description'][:32]}"
-                        f"{'…' if len(row['description']) > 32 else ''}</small>",
+                        f"<small title='{row['description']}'>{row['description'][:28]}"
+                        f"{'…' if len(row['description']) > 28 else ''}</small>",
                         unsafe_allow_html=True
                     )
 
@@ -1313,18 +1345,29 @@ def tab_validation(df_all: pd.DataFrame):
                         "kat", sub_list, key=f"sel_{tid}",
                         label_visibility="collapsed",
                     )
-                    st.session_state.bulk_selections[tid] = (sel, tx_type)
+
+                    # Notes input — ambil nilai existing jika ada
+                    existing_notes = str(row.get("notes", "") or "")
+                    note_val = c7.text_input(
+                        "notes",
+                        value=existing_notes,
+                        placeholder="Tambah catatan...",
+                        key=f"note_{tid}",
+                        label_visibility="collapsed",
+                    )
+
+                    st.session_state.bulk_selections[tid] = (sel, tx_type, note_val)
 
                     # Tombol simpan per baris
-                    if c7.button("💾", key=f"save_{tid}", help="Simpan"):
-                        pending_saves.append((sel, tx_type, tid))
+                    if c8.button("💾", key=f"save_{tid}", help="Simpan kategori & notes"):
+                        pending_saves.append((sel, tx_type, note_val, tid))
 
                     st.markdown("<hr style='margin:2px 0;opacity:0.15'>", unsafe_allow_html=True)
 
-                # Proses simpan per-baris
+                # Proses simpan per-baris (include notes)
                 if pending_saves:
-                    updates = [(s, sub_to_cat(s, t), i) for s, t, i in pending_saves]
-                    bulk_update_categories(updates)
+                    updates = [(s, sub_to_cat(s, t), n, i) for s, t, n, i in pending_saves]
+                    bulk_update_categories_and_notes(updates)
                     st.success(f"✅ {len(updates)} transaksi tersimpan!")
                     st.rerun()
 
@@ -1337,10 +1380,16 @@ def tab_validation(df_all: pd.DataFrame):
                     for _, row in filtered.iterrows():
                         tid = int(row["id"])
                         if tid in st.session_state.bulk_selections:
-                            sel_sub, tx_type = st.session_state.bulk_selections[tid]
-                            updates.append((sel_sub, sub_to_cat(sel_sub, tx_type), tid))
+                            sel_data = st.session_state.bulk_selections[tid]
+                            # Support both old (sel, tx_type) and new (sel, tx_type, notes) format
+                            if len(sel_data) == 3:
+                                sel_sub, tx_type, notes = sel_data
+                            else:
+                                sel_sub, tx_type = sel_data
+                                notes = str(st.session_state.get(f"note_{tid}", ""))
+                            updates.append((sel_sub, sub_to_cat(sel_sub, tx_type), notes, tid))
                     if updates:
-                        bulk_update_categories(updates)
+                        bulk_update_categories_and_notes(updates)
                         st.session_state.bulk_selections = {}
                         st.success(f"✅ {len(updates)} transaksi berhasil dikategorikan!")
                         st.rerun()
@@ -1400,9 +1449,21 @@ def tab_validation(df_all: pd.DataFrame):
             c_sel2.markdown(f"**Parent category:** {sub_to_cat(new_sub, tx_type)}")
             c_sel2.markdown(f"**Tipe:** {tx_type}")
 
+            # Notes input untuk mode satu per satu
+            existing_notes_single = str(sel_row.get("notes", "") or "")
+            notes_single = st.text_area(
+                "📝 Notes / Catatan tambahan (opsional):",
+                value=existing_notes_single,
+                placeholder="e.g. Makan siang bersama tim, reimbursable, hadiah ulang tahun...",
+                height=70,
+                key=f"notes_single_{ids_list[current_idx]}",
+            )
+
             btn1, btn2, btn3 = st.columns(3)
             if btn1.button("✅ Sahkan & Lanjut", type="primary", use_container_width=True):
                 update_sub_category(int(ids_list[current_idx]), new_sub, tx_type)
+                if notes_single.strip():
+                    update_notes(int(ids_list[current_idx]), notes_single)
                 if st.session_state.val_idx < total - 1:
                     st.session_state.val_idx += 1
                 else:
@@ -1411,6 +1472,8 @@ def tab_validation(df_all: pd.DataFrame):
 
             if btn2.button("✅ Sahkan Saja", use_container_width=True):
                 update_sub_category(int(ids_list[current_idx]), new_sub, tx_type)
+                if notes_single.strip():
+                    update_notes(int(ids_list[current_idx]), notes_single)
                 st.success("Tersahkan!")
                 st.rerun()
 
@@ -1441,9 +1504,20 @@ def tab_validation(df_all: pd.DataFrame):
         hist = hist[hist["description"].str.contains(h_search, case=False, na=False)]
 
     st.caption(f"Menampilkan {len(hist)} transaksi")
-    display_cols = ["date", "description", "amount", "type", "sub_category", "category", "pocket"]
+    display_cols = ["date", "description", "amount", "type", "sub_category", "category", "pocket", "notes"]
     display_cols = [c for c in display_cols if c in hist.columns]
-    st.dataframe(hist[display_cols], use_container_width=True, height=350, hide_index=True)
+    st.dataframe(
+        hist[display_cols].rename(columns={
+            "date": "Tanggal", "description": "Deskripsi", "amount": "Jumlah",
+            "type": "Tipe", "sub_category": "Sub-Kategori", "category": "Kategori",
+            "pocket": "Pocket", "notes": "Notes 📝",
+        }),
+        use_container_width=True, height=350, hide_index=True,
+        column_config={
+            "Notes 📝": st.column_config.TextColumn("Notes 📝", width="medium"),
+            "Jumlah":   st.column_config.NumberColumn("Jumlah", format="Rp %d"),
+        }
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
