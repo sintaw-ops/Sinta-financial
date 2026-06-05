@@ -40,7 +40,6 @@ CATEGORY_SEED = [
     ("Transfer", "Internal Transfer",         "internal transfer",       0),
 ]
 
-# Warna per parent category untuk chart harian
 CATEGORY_COLORS = {
     "Essential Living":          "#E24B4A",
     "Health & Wellness":         "#378ADD",
@@ -51,14 +50,15 @@ CATEGORY_COLORS = {
     "Uncategorized":             "#888780",
 }
 
+
 def hex_to_rgba(hex_color: str, alpha: float = 0.15) -> str:
-    """Konversi hex color ke rgba string yang valid untuk Plotly."""
     h = hex_color.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return f"rgba({r},{g},{b},{alpha})"
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — DATABASE LAYER (OPTIMIZED)
+# SECTION 2 — DATABASE LAYER
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource
@@ -110,6 +110,7 @@ def init_db():
                 category TEXT NOT NULL,
                 sub_category TEXT NOT NULL DEFAULT 'uncategorized',
                 pocket TEXT,
+                source TEXT DEFAULT 'manual',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 CONSTRAINT unique_tx UNIQUE(date, description, amount)
             )
@@ -159,8 +160,9 @@ def save_transactions(df: pd.DataFrame) -> tuple[int, int]:
     conn = _conn()
     rows = []
     for _, row in df.iterrows():
-        sub = str(row.get("sub_category", "uncategorized")).strip()
+        sub    = str(row.get("sub_category", "uncategorized")).strip()
         tx_type = str(row["type"])
+        source  = str(row.get("source", "manual"))
         rows.append((
             str(row["date"])[:10],
             str(row["description"]),
@@ -169,6 +171,7 @@ def save_transactions(df: pd.DataFrame) -> tuple[int, int]:
             sub_to_cat(sub, tx_type),
             sub,
             str(row.get("pocket", "")),
+            source,
         ))
     if not rows:
         return 0, 0
@@ -176,7 +179,7 @@ def save_transactions(df: pd.DataFrame) -> tuple[int, int]:
         execute_values(
             c,
             """INSERT INTO transactions
-               (date, description, amount, type, category, sub_category, pocket)
+               (date, description, amount, type, category, sub_category, pocket, source)
                VALUES %s ON CONFLICT (date, description, amount) DO NOTHING""",
             rows,
         )
@@ -204,8 +207,6 @@ def delete_transaction(tid: int):
     conn.commit()
     load_all_transactions.clear()
 
-
-# ── Master Data: Categories ───────────────────────────────────────────────────
 
 def upsert_category(tx_type: str, parent: str, sub: str, budget: float):
     conn = _conn()
@@ -242,8 +243,9 @@ def update_budget(sub: str, new_budget: float):
     conn.commit()
     load_categories_df.clear()
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — PDF PARSER ENGINE
+# SECTION 3 — PDF PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_pdf_data(file, password, bank_type):
@@ -266,8 +268,10 @@ def extract_pdf_data(file, password, bank_type):
                             tx_type = "Income" if "Incoming" in line or "Credit" in line else "Expense"
                             transactions.append({
                                 "date": datetime.strptime(match.group(1), "%d %b %Y").strftime("%Y-%m-%d"),
-                                "description": match.group(2)[:40], "amount": amount, "type": tx_type,
-                                "pocket": "Sinarmas", "sub_category": "uncategorized", "category": "Uncategorized",
+                                "description": match.group(2)[:40], "amount": amount,
+                                "type": tx_type, "pocket": "Sinarmas",
+                                "sub_category": "uncategorized", "category": "Uncategorized",
+                                "source": "pdf",
                             })
                     elif bank_type == "Jenius CC":
                         match = re.search(r'(\d{2}\s[a-zA-Z]{3}\s\d{4})\s+\d{2}\s[a-zA-Z]{3}\s\d{4}\s+(.+?)\s+([\d\,\.]+)(?:\sCR)?$', line)
@@ -276,8 +280,10 @@ def extract_pdf_data(file, password, bank_type):
                             tx_type = "Income" if "CR" in line or "Pembayaran" in line else "Expense"
                             transactions.append({
                                 "date": datetime.strptime(match.group(1), "%d %b %Y").strftime("%Y-%m-%d"),
-                                "description": match.group(2)[:40], "amount": amount, "type": tx_type,
-                                "pocket": "Jenius CC", "sub_category": "uncategorized", "category": "Uncategorized",
+                                "description": match.group(2)[:40], "amount": amount,
+                                "type": tx_type, "pocket": "Jenius CC",
+                                "sub_category": "uncategorized", "category": "Uncategorized",
+                                "source": "pdf",
                             })
                     elif bank_type == "Bank Jago":
                         match = re.search(r'(\d{2}\s[a-zA-Z]{3}\s\d{4})\s+\d{2}\.\d{2}\s+(.+?)\s+([\-\+])([\d\.]+)', line)
@@ -286,15 +292,187 @@ def extract_pdf_data(file, password, bank_type):
                             tx_type = "Income" if match.group(3) == "+" else "Expense"
                             transactions.append({
                                 "date": datetime.strptime(match.group(1), "%d %b %Y").strftime("%Y-%m-%d"),
-                                "description": match.group(2)[:40], "amount": amount, "type": tx_type,
-                                "pocket": "Bank Jago", "sub_category": "uncategorized", "category": "Uncategorized",
+                                "description": match.group(2)[:40], "amount": amount,
+                                "type": tx_type, "pocket": "Bank Jago",
+                                "sub_category": "uncategorized", "category": "Uncategorized",
+                                "source": "pdf",
                             })
     except Exception as e:
         return None, str(e)
     return pd.DataFrame(transactions), None
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — HELPERS
+# SECTION 4 — EMAIL PARSER (IMAP)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_email_date(date_str: str) -> str:
+    for fmt in ["%a, %d %b %Y %H:%M:%S %z", "%d %b %Y %H:%M:%S %z",
+                "%a, %d %b %Y %H:%M:%S %Z", "%d %b %Y %H:%M:%S"]:
+        try:
+            return datetime.strptime(date_str[:31].strip(), fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _extract_amount(text: str):
+    patterns = [
+        r"IDR\s*([\d\.,]+)", r"Rp\.?\s*([\d\.,]+)",
+        r"Rp\s*([\d\.]+)", r"([\d\.]{4,})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            raw = m.group(1).replace(".", "").replace(",", "")
+            try:
+                val = float(raw)
+                if val > 100:
+                    return val
+            except ValueError:
+                continue
+    return None
+
+
+def parse_bank_email(subject: str, body: str, email_date: str, sender: str) -> dict | None:
+    try:
+        tx_date = _parse_email_date(email_date)
+        text_all = (subject + " " + body).lower()
+        full_text = subject + " " + body
+
+        # Deteksi bank dari sender
+        if "jago" in sender:
+            pocket = "Bank Jago"
+        elif "jenius" in sender or "btpn" in sender:
+            pocket = "Jenius"
+        elif "sinarmas" in sender:
+            pocket = "Sinarmas"
+        else:
+            pocket = "Email"
+
+        # Deteksi tipe transaksi
+        debit_kw  = ["debit", "keluar", "pembayaran", "payment", "transfer out",
+                     "belanja", "withdraw", "tarik", "purchase", "transaksi debet"]
+        credit_kw = ["kredit", "masuk", "incoming", "top up", "credit", "terima",
+                     "receive", "transfer in", "transaksi kredit"]
+
+        if any(k in text_all for k in credit_kw):
+            tx_type = "Income"
+        elif any(k in text_all for k in debit_kw):
+            tx_type = "Expense"
+        else:
+            tx_type = "Expense"
+
+        amount = _extract_amount(full_text)
+        if not amount:
+            return None
+
+        # Deskripsi
+        desc_patterns = [
+            r"(?:merchant|toko|at|to|ke|dari|untuk)[:\s]+([^\n\r,]{3,40})",
+            r"(?:transaksi di|pembelian di|transfer ke)[:\s]+([^\n\r,]{3,40})",
+            r"(?:keterangan)[:\s]+([^\n\r]{3,40})",
+        ]
+        description = subject[:40] if subject else f"{pocket} Transaction"
+        for pat in desc_patterns:
+            m = re.search(pat, body, re.IGNORECASE)
+            if m:
+                description = m.group(1).strip()[:40]
+                break
+
+        return {
+            "date":         tx_date,
+            "description":  description,
+            "amount":       amount,
+            "type":         tx_type,
+            "pocket":       pocket,
+            "sub_category": "uncategorized",
+            "category":     "Uncategorized",
+            "source":       "email",
+        }
+    except Exception:
+        return None
+
+
+def fetch_email_transactions(email_addr: str, app_password: str,
+                              days_back: int = 7) -> tuple[list, list, str]:
+    import imaplib
+    import email as email_lib
+    from email.header import decode_header
+
+    transactions = []
+    raw_emails   = []
+    errors       = []
+
+    BANK_SENDERS = ["jago", "btpn", "jenius", "sinarmas", "bank"]
+
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        mail.login(email_addr, app_password)
+    except Exception as e:
+        return [], [], f"Gagal login Gmail: {e}"
+
+    try:
+        mail.select("INBOX")
+        since_date = (datetime.now().replace(hour=0, minute=0, second=0)
+                      - __import__('datetime').timedelta(days=days_back)).strftime("%d-%b-%Y")
+
+        for keyword in BANK_SENDERS:
+            try:
+                _, ids = mail.search(None, f'(SINCE "{since_date}" FROM "{keyword}")')
+                for msg_id in ids[0].split():
+                    try:
+                        _, data = mail.fetch(msg_id, "(RFC822)")
+                        msg = email_lib.message_from_bytes(data[0][1])
+
+                        # Decode subject
+                        raw_subj, enc = decode_header(msg["Subject"] or "")[0]
+                        subject = raw_subj.decode(enc or "utf-8", errors="ignore") \
+                            if isinstance(raw_subj, bytes) else (raw_subj or "")
+
+                        sender   = msg.get("From", "").lower()
+                        date_str = msg.get("Date", "")
+
+                        # Extract body
+                        body = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    try:
+                                        body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                        break
+                                    except Exception:
+                                        pass
+                        else:
+                            try:
+                                body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+                            except Exception:
+                                pass
+
+                        raw_emails.append({
+                            "subject": subject, "from": sender,
+                            "date": date_str, "body": body[:500],
+                        })
+
+                        tx = parse_bank_email(subject, body, date_str, sender)
+                        if tx:
+                            transactions.append(tx)
+
+                    except Exception as e:
+                        errors.append(f"Parse error msg {msg_id}: {e}")
+            except Exception as e:
+                errors.append(f"Search error [{keyword}]: {e}")
+
+        mail.logout()
+
+    except Exception as e:
+        errors.append(f"IMAP error: {e}")
+
+    return transactions, raw_emails, "; ".join(errors)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fmt_idr(v: float) -> str:
@@ -310,8 +488,9 @@ def plotly_base() -> dict:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — UI: DASHBOARD
+# SECTION 6 — UI: DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def tab_dashboard(df_all: pd.DataFrame):
@@ -358,10 +537,10 @@ def tab_dashboard(df_all: pd.DataFrame):
     ti, te = inc_df["amount"].sum(), exp_df["amount"].sum()
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("💰 Pemasukan",  fmt_idr(ti))
+    c1.metric("💰 Pemasukan",   fmt_idr(ti))
     c2.metric("💸 Pengeluaran", fmt_idr(te))
-    c3.metric("🏦 Net Income", fmt_idr(ti - te))
-    c4.metric("🔥 Burn Rate",  f"{(te / ti * 100) if ti > 0 else 0:.1f}%")
+    c3.metric("🏦 Net Income",  fmt_idr(ti - te))
+    c4.metric("🔥 Burn Rate",   f"{(te / ti * 100) if ti > 0 else 0:.1f}%")
     st.divider()
 
     st.markdown("### 📉 Tren Pengeluaran vs Pemasukan")
@@ -409,13 +588,13 @@ def tab_dashboard(df_all: pd.DataFrame):
         else:
             st.info("Belum ada alokasi saving di periode ini.")
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — UI: BUDGET VS ACTUAL (FIXED + ENHANCED)
+# SECTION 7 — UI: BUDGET VS ACTUAL
 # ══════════════════════════════════════════════════════════════════════════════
 
 def tab_budget_vs_actual(df_all: pd.DataFrame):
     st.title("🎯 Budget vs Actual")
-
     if df_all.empty:
         st.info("Belum ada data transaksi.")
         return
@@ -428,12 +607,11 @@ def tab_budget_vs_actual(df_all: pd.DataFrame):
     df_exp["month"] = df_exp["date"].dt.month
     df_exp["day"]   = df_exp["date"].dt.day
 
-    # ── Filter Tahun + Bulan ──────────────────────────────────────────────────
     with st.container(border=True):
         col1, col2 = st.columns([1, 3])
-        avail_years = sorted(df_exp["year"].unique(), reverse=True) if not df_exp.empty else [datetime.now().year]
-        sel_year    = col1.selectbox("Filter Tahun", avail_years)
-        df_year     = df_exp[df_exp["year"] == sel_year]
+        avail_years  = sorted(df_exp["year"].unique(), reverse=True) if not df_exp.empty else [datetime.now().year]
+        sel_year     = col1.selectbox("Filter Tahun", avail_years)
+        df_year      = df_exp[df_exp["year"] == sel_year]
         avail_months = sorted(df_year["month"].unique())
         sel_months   = col2.multiselect(
             "Filter Bulan", avail_months, default=avail_months,
@@ -447,31 +625,26 @@ def tab_budget_vs_actual(df_all: pd.DataFrame):
     df_f     = df_year[df_year["month"].isin(sel_months)]
     n_months = len(sel_months)
 
-    # Ambil budget dari DB (real-time, bukan hardcode)
     cat_df  = load_categories_df()
     bud_map = dict(zip(cat_df["sub_category"], cat_df["monthly_budget"]))
-    total_budget_from_db = cat_df[cat_df["tx_type"] == "Expense"]["monthly_budget"].sum() * n_months
-
+    total_budget = cat_df[cat_df["tx_type"] == "Expense"]["monthly_budget"].sum() * n_months
     total_actual = df_f["amount"].sum()
-    burn_rate    = (total_actual / total_budget_from_db * 100) if total_budget_from_db > 0 else 0
-    selisih      = total_budget_from_db - total_actual
+    burn_rate    = (total_actual / total_budget * 100) if total_budget > 0 else 0
+    selisih      = total_budget - total_actual
 
-    # ── KPI ──────────────────────────────────────────────────────────────────
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("🎯 Total Budget",  fmt_idr(total_budget_from_db), f"{n_months} bulan")
+    k1.metric("🎯 Total Budget",  fmt_idr(total_budget), f"{n_months} bulan")
     k2.metric("💸 Total Actual",  fmt_idr(total_actual))
     k3.metric(
-        "📊 Selisih",
-        fmt_idr(abs(selisih)),
+        "📊 Selisih", fmt_idr(abs(selisih)),
         delta=f"{'Under' if selisih >= 0 else 'Over'} budget",
         delta_color="normal" if selisih >= 0 else "inverse",
     )
     k4.metric("🔥 Burn Rate", f"{burn_rate:.1f}%")
     st.divider()
 
-    # ── Actual vs Budget per Sub-Kategori ────────────────────────────────────
+    # Actual vs Budget per sub-kategori
     st.markdown("### 📊 Actual vs Budget per Sub-Kategori")
-
     actual_by_sub = df_f.groupby("sub_category")["amount"].sum().reset_index()
     actual_by_sub.columns = ["sub_category", "actual"]
     actual_by_sub["budget"] = actual_by_sub["sub_category"].map(bud_map).fillna(0) * n_months
@@ -482,142 +655,106 @@ def tab_budget_vs_actual(df_all: pd.DataFrame):
 
     fig_bva = go.Figure()
     fig_bva.add_trace(go.Bar(
-        y=actual_by_sub["sub_category"],
-        x=actual_by_sub["actual"],
-        name="Actual",
-        orientation="h",
-        marker_color=[
-            "#E24B4A" if row["actual"] > row["budget"] else "#639922"
-            for _, row in actual_by_sub.iterrows()
-        ],
+        y=actual_by_sub["sub_category"], x=actual_by_sub["actual"],
+        name="Actual", orientation="h",
+        marker_color=["#E24B4A" if r["actual"] > r["budget"] else "#639922"
+                      for _, r in actual_by_sub.iterrows()],
     ))
     fig_bva.add_trace(go.Scatter(
-        y=actual_by_sub["sub_category"],
-        x=actual_by_sub["budget"],
-        name="Budget",
-        mode="markers",
+        y=actual_by_sub["sub_category"], x=actual_by_sub["budget"],
+        name="Budget", mode="markers",
         marker=dict(symbol="line-ns", size=14, color="#f39c12",
                     line=dict(width=2, color="#f39c12")),
     ))
-    fig_bva.update_layout(
-        **plotly_base(),
-        height=max(350, len(actual_by_sub) * 32),
-        xaxis_title="IDR",
-        yaxis_title="",
-    )
+    fig_bva.update_layout(**plotly_base(), height=max(350, len(actual_by_sub) * 32),
+                           xaxis_title="IDR", yaxis_title="")
     st.plotly_chart(fig_bva, use_container_width=True)
 
-    # ── Progress Bar per Parent Category ─────────────────────────────────────
+    # Progress per parent category
     st.markdown("### 📁 Realisasi per Kategori Induk")
-
     parent_budget = (
         cat_df[cat_df["tx_type"] == "Expense"]
         .groupby("parent_category")["monthly_budget"].sum() * n_months
     ).reset_index()
     parent_budget.columns = ["category", "budget"]
-
     actual_by_cat = df_f.groupby("category")["amount"].sum().reset_index()
     actual_by_cat.columns = ["category", "actual"]
-
     merged = parent_budget.merge(actual_by_cat, on="category", how="left").fillna(0)
     merged = merged[merged["budget"] > 0].sort_values("budget", ascending=False)
 
     for _, row in merged.iterrows():
-        pct   = (row["actual"] / row["budget"] * 100) if row["budget"] > 0 else 0
-        over  = row["actual"] > row["budget"]
-        label = "🔴" if over else ("🟡" if pct > 85 else "🟢")
+        pct  = (row["actual"] / row["budget"] * 100) if row["budget"] > 0 else 0
+        over = row["actual"] > row["budget"]
+        lbl  = "🔴" if over else ("🟡" if pct > 85 else "🟢")
         c_a, c_b = st.columns([3, 1])
-        c_a.markdown(f"**{row['category']}** {label}")
+        c_a.markdown(f"**{row['category']}** {lbl}")
         c_b.markdown(f"`{fmt_idr(row['actual'])} / {fmt_idr(row['budget'])}` — **{min(pct,100):.1f}%**")
         st.progress(min(pct / 100, 1.0))
-
     st.divider()
 
-    # ── Pengeluaran Harian — Total ────────────────────────────────────────────
+    # Pengeluaran Harian Total
     st.markdown("### 📅 Pengeluaran Harian — Total")
-
     import calendar
-    total_days = sum(calendar.monthrange(sel_year, m)[1] for m in sel_months)
-    daily_budget_line = total_budget_from_db / total_days if total_days > 0 else MONTHLY_BUDGET / 30
-
-    all_days    = pd.DataFrame({"day": range(1, 32)})
-    daily_total = df_f.groupby("day")["amount"].sum().reset_index()
-    daily_total = all_days.merge(daily_total, on="day", how="left").fillna(0)
+    total_days       = sum(calendar.monthrange(sel_year, m)[1] for m in sel_months)
+    daily_budget_line = total_budget / total_days if total_days > 0 else MONTHLY_BUDGET / 30
+    all_days          = pd.DataFrame({"day": range(1, 32)})
+    daily_total       = df_f.groupby("day")["amount"].sum().reset_index()
+    daily_total       = all_days.merge(daily_total, on="day", how="left").fillna(0)
 
     fig_daily = go.Figure()
     fig_daily.add_trace(go.Scatter(
         x=daily_total["day"], y=daily_total["amount"],
         mode="lines+markers", name="Actual Harian",
-        line=dict(color="#E24B4A", width=2),
-        marker=dict(size=5),
-        fill="tozeroy",
-        fillcolor=hex_to_rgba("#E24B4A", 0.08),
+        line=dict(color="#E24B4A", width=2), marker=dict(size=5),
+        fill="tozeroy", fillcolor=hex_to_rgba("#E24B4A", 0.08),
     ))
     fig_daily.add_hline(
-        y=daily_budget_line,
-        line_dash="dash", line_color="#f39c12", line_width=2,
+        y=daily_budget_line, line_dash="dash", line_color="#f39c12", line_width=2,
         annotation_text=f"Budget/hari ({fmt_idr(daily_budget_line)})",
         annotation_position="top right",
     )
-    fig_daily.update_layout(
-        **plotly_base(),
-        height=320,
-        xaxis=dict(title="Tanggal", tickmode="linear", tick0=1, dtick=5),
-        yaxis=dict(title="IDR"),
-    )
+    fig_daily.update_layout(**plotly_base(), height=320,
+                             xaxis=dict(title="Tanggal", tickmode="linear", tick0=1, dtick=5),
+                             yaxis=dict(title="IDR"))
     st.plotly_chart(fig_daily, use_container_width=True)
 
-    # ── Pengeluaran Harian — Per Kategori (FIXED fillcolor) ───────────────────
+    # Pengeluaran Harian Per Kategori
     st.markdown("### 🗂️ Pengeluaran Harian per Kategori")
-
     parent_cats = sorted(df_f["category"].unique().tolist())
-    sel_cats    = st.multiselect(
-        "Pilih Kategori:", parent_cats, default=parent_cats,
-    )
+    sel_cats    = st.multiselect("Pilih Kategori:", parent_cats, default=parent_cats)
 
     if sel_cats:
         df_cat_day = (
             df_f[df_f["category"].isin(sel_cats)]
-            .groupby(["day", "category"])["amount"]
-            .sum().reset_index()
+            .groupby(["day", "category"])["amount"].sum().reset_index()
         )
         fig_cat = go.Figure()
         for cat in sel_cats:
-            cat_data = all_days.merge(
-                df_cat_day[df_cat_day["category"] == cat],
-                on="day", how="left",
-            ).fillna(0)
+            cat_data   = all_days.merge(df_cat_day[df_cat_day["category"] == cat],
+                                        on="day", how="left").fillna(0)
             color      = CATEGORY_COLORS.get(cat, "#888780")
-            fill_color = hex_to_rgba(color, 0.15)          # ← FIXED: pakai hex_to_rgba()
+            fill_color = hex_to_rgba(color, 0.15)
             fig_cat.add_trace(go.Scatter(
-                x=cat_data["day"],
-                y=cat_data["amount"],
-                name=cat,
-                mode="lines",
+                x=cat_data["day"], y=cat_data["amount"],
+                name=cat, mode="lines",
                 line=dict(color=color, width=2),
-                fill="tonexty",
-                fillcolor=fill_color,
+                fill="tonexty", fillcolor=fill_color,
                 stackgroup="one",
             ))
         fig_cat.add_hline(
-            y=daily_budget_line,
-            line_dash="dash", line_color="#f39c12", line_width=2,
+            y=daily_budget_line, line_dash="dash", line_color="#f39c12", line_width=2,
             annotation_text=f"Budget/hari ({fmt_idr(daily_budget_line)})",
             annotation_position="top right",
         )
-        fig_cat.update_layout(
-            **plotly_base(),
-            height=380,
-            xaxis=dict(title="Tanggal", tickmode="linear", tick0=1, dtick=5),
-            yaxis=dict(title="IDR"),
-        )
+        fig_cat.update_layout(**plotly_base(), height=380,
+                               xaxis=dict(title="Tanggal", tickmode="linear", tick0=1, dtick=5),
+                               yaxis=dict(title="IDR"))
         st.plotly_chart(fig_cat, use_container_width=True)
     else:
         st.info("Pilih minimal satu kategori.")
-
     st.divider()
 
-    # ── Tabel Ringkasan ───────────────────────────────────────────────────────
+    # Tabel Ringkasan
     st.markdown("### 📋 Tabel Ringkasan Aktual vs Budget")
     summary = actual_by_sub.copy()
     summary["selisih"] = summary["budget"] - summary["actual"]
@@ -630,29 +767,27 @@ def tab_budget_vs_actual(df_all: pd.DataFrame):
     display["% Realisasi"] = display["% Realisasi"].apply(lambda v: f"{v:.1f}%")
     st.dataframe(display, use_container_width=True, hide_index=True)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — UI: MASTER DATA MANAGEMENT (NEW)
+# SECTION 8 — UI: MASTER DATA MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def tab_master_data():
     st.title("🗂️ Master Data Management")
-    st.caption("Kelola kategori, sub-kategori, dan budget bulanan per sub-kategori.")
+    st.caption("Kelola kategori, sub-kategori, dan budget bulanan.")
 
     cat_df = load_categories_df()
+    tab_exp, tab_inc, tab_trans = st.tabs(
+        ["💸 Expense Categories", "💰 Income Categories", "🔄 Transfer"]
+    )
 
-    tab_exp, tab_inc, tab_trans = st.tabs([
-        "💸 Expense Categories", "💰 Income Categories", "🔄 Transfer"
-    ])
-
-    # ── EXPENSE ───────────────────────────────────────────────────────────────
     with tab_exp:
         exp_df = cat_df[cat_df["tx_type"] == "Expense"].copy()
-
         st.markdown("#### ➕ Tambah / Edit Sub-Kategori Expense")
         with st.form("form_add_exp", clear_on_submit=True):
             c1, c2, c3 = st.columns(3)
             new_parent = c1.text_input("Parent Category", placeholder="e.g. Health & Wellness")
-            new_sub    = c2.text_input("Sub-Category", placeholder="e.g. vitamins")
+            new_sub    = c2.text_input("Sub-Category",    placeholder="e.g. vitamins")
             new_budget = c3.number_input("Budget Bulanan (IDR)", min_value=0.0, step=50_000.0)
             if st.form_submit_button("💾 Simpan", type="primary"):
                 if new_parent and new_sub:
@@ -664,24 +799,17 @@ def tab_master_data():
 
         st.divider()
         st.markdown("#### 📋 Daftar Sub-Kategori Expense")
-
-        # Tampilkan per parent category
         for parent in sorted(exp_df["parent_category"].unique()):
-            grp = exp_df[exp_df["parent_category"] == parent].reset_index(drop=True)
+            grp       = exp_df[exp_df["parent_category"] == parent].reset_index(drop=True)
             total_bud = grp["monthly_budget"].sum()
             with st.expander(f"**{parent}** — Budget total: {fmt_idr(total_bud)}/bln", expanded=True):
                 for _, row in grp.iterrows():
                     col_a, col_b, col_c, col_d = st.columns([3, 2, 1, 1])
                     col_a.markdown(f"**{row['sub_category']}**")
-
-                    # Edit budget inline
                     new_bud = col_b.number_input(
-                        "Budget/bln",
-                        value=float(row["monthly_budget"]),
-                        min_value=0.0,
-                        step=50_000.0,
-                        key=f"bud_{row['sub_category']}",
-                        label_visibility="collapsed",
+                        "Budget/bln", value=float(row["monthly_budget"]),
+                        min_value=0.0, step=50_000.0,
+                        key=f"bud_{row['sub_category']}", label_visibility="collapsed",
                     )
                     if col_c.button("💾", key=f"save_{row['sub_category']}", help="Simpan budget"):
                         update_budget(row["sub_category"], new_bud)
@@ -695,19 +823,14 @@ def tab_master_data():
                         col_d.markdown("—")
 
         st.divider()
-
-        # ── Summary budget total ──────────────────────────────────────────────
         total_all = exp_df["monthly_budget"].sum()
         st.markdown(f"**💡 Total Budget Expense per bulan: {fmt_idr(total_all)}**")
 
-        # ── Bulk budget update via tabel editable ─────────────────────────────
         st.markdown("#### ✏️ Edit Budget Massal (Tabel)")
         edit_df = exp_df[["parent_category", "sub_category", "monthly_budget"]].copy()
         edit_df.columns = ["Parent Category", "Sub-Kategori", "Budget Bulanan (IDR)"]
         edited = st.data_editor(
-            edit_df,
-            use_container_width=True,
-            hide_index=True,
+            edit_df, use_container_width=True, hide_index=True,
             column_config={
                 "Budget Bulanan (IDR)": st.column_config.NumberColumn(
                     "Budget Bulanan (IDR)", min_value=0, step=50000, format="Rp %d"
@@ -723,23 +846,20 @@ def tab_master_data():
             load_categories_df.clear()
             st.rerun()
 
-    # ── INCOME ────────────────────────────────────────────────────────────────
     with tab_inc:
         inc_df = cat_df[cat_df["tx_type"] == "Income"].copy()
-
         st.markdown("#### ➕ Tambah Sub-Kategori Income")
         with st.form("form_add_inc", clear_on_submit=True):
             c1, c2 = st.columns(2)
-            new_parent_i = c1.text_input("Parent Category", placeholder="e.g. Freelance")
-            new_sub_i    = c2.text_input("Sub-Category", placeholder="e.g. project fee")
+            new_pi = c1.text_input("Parent Category", placeholder="e.g. Freelance")
+            new_si = c2.text_input("Sub-Category",    placeholder="e.g. project fee")
             if st.form_submit_button("💾 Simpan", type="primary"):
-                if new_parent_i and new_sub_i:
-                    upsert_category("Income", new_parent_i, new_sub_i, 0)
-                    st.success(f"✅ '{new_sub_i}' berhasil disimpan!")
+                if new_pi and new_si:
+                    upsert_category("Income", new_pi, new_si, 0)
+                    st.success(f"✅ '{new_si}' berhasil disimpan!")
                     st.rerun()
                 else:
                     st.warning("Semua field wajib diisi.")
-
         st.divider()
         st.markdown("#### 📋 Daftar Sub-Kategori Income")
         for _, row in inc_df.iterrows():
@@ -749,7 +869,6 @@ def tab_master_data():
                 delete_category(row["sub_category"])
                 st.rerun()
 
-    # ── TRANSFER ──────────────────────────────────────────────────────────────
     with tab_trans:
         tra_df = cat_df[cat_df["tx_type"] == "Transfer"].copy()
         st.markdown("#### 📋 Daftar Sub-Kategori Transfer")
@@ -760,15 +879,149 @@ def tab_master_data():
             use_container_width=True, hide_index=True,
         )
         with st.form("form_add_tra", clear_on_submit=True):
-            new_sub_t = st.text_input("Tambah Sub-Category Transfer", placeholder="e.g. tabungan bersama")
+            new_st = st.text_input("Tambah Sub-Category Transfer", placeholder="e.g. tabungan bersama")
             if st.form_submit_button("💾 Simpan"):
-                if new_sub_t:
-                    upsert_category("Transfer", "Internal Transfer", new_sub_t, 0)
-                    st.success(f"✅ '{new_sub_t}' ditambahkan!")
+                if new_st:
+                    upsert_category("Transfer", "Internal Transfer", new_st, 0)
+                    st.success(f"✅ '{new_st}' ditambahkan!")
                     st.rerun()
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — UI: INGESTION DATA
+# SECTION 9 — UI: EMAIL SYNC
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tab_email_sync():
+    st.title("📧 Sinkronisasi Email Bank")
+    st.caption(
+        "Tarik otomatis transaksi dari notifikasi email Bank Jago, Jenius, dan Sinarmas "
+        "menggunakan Gmail IMAP + App Password."
+    )
+
+    with st.expander("ℹ️ Cara membuat Gmail App Password", expanded=False):
+        st.markdown("""
+        **Langkah 1:** Pastikan sudah login ke Gmail personal (`sintawuln@gmail.com`)
+
+        **Langkah 2:** Aktifkan 2-Factor Authentication di
+        [myaccount.google.com/security](https://myaccount.google.com/security)
+
+        **Langkah 3:** Buka [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+
+        **Langkah 4:** Klik **"Buat App Password"** → beri nama `CFO Console` → klik **Buat**
+
+        **Langkah 5:** Salin 16-karakter yang muncul (format: `xxxx xxxx xxxx xxxx`)
+
+        **Langkah 6:** Tambahkan ke Streamlit Secrets:
+        ```toml
+        GMAIL_EMAIL = "sintawuln@gmail.com"
+        GMAIL_APP_PASSWORD = "xxxxxxxxxxxxxxxx"
+        ```
+
+        > ⚠️ Pastikan email notifikasi bank sudah diset ke `sintawuln@gmail.com`
+        > di pengaturan aplikasi Bank Jago / Jenius / Sinarmas.
+        """)
+
+    st.divider()
+
+    # Konfigurasi
+    with st.container(border=True):
+        st.markdown("#### 🔐 Konfigurasi Koneksi Gmail")
+
+        has_secrets = ("GMAIL_EMAIL" in st.secrets and "GMAIL_APP_PASSWORD" in st.secrets)
+
+        if has_secrets:
+            email_addr   = st.secrets["GMAIL_EMAIL"]
+            app_password = st.secrets["GMAIL_APP_PASSWORD"]
+            st.success(f"✅ Kredensial tersimpan di Secrets. Akun: **{email_addr}**")
+        else:
+            st.info("💡 Simpan kredensial di **Streamlit Secrets** untuk keamanan lebih baik.")
+            c1, c2   = st.columns(2)
+            email_addr   = c1.text_input("Gmail Address", value="sintawuln@gmail.com")
+            app_password = c2.text_input("App Password (16 karakter)", type="password",
+                                          placeholder="xxxx xxxx xxxx xxxx")
+
+        days_back = st.slider("Rentang waktu cek email (hari ke belakang)", 1, 30, 7)
+
+    st.divider()
+
+    # Tombol aksi
+    col1, col2, col3 = st.columns([1, 1, 2])
+    do_fetch   = col1.button("🔄 Cek & Simpan Email", type="primary", use_container_width=True)
+    do_preview = col2.button("👁️ Preview Saja",        use_container_width=True)
+    do_refresh = col3.button("🔃 Refresh Data Tersimpan", use_container_width=True)
+
+    # Refresh cache data
+    if do_refresh:
+        load_all_transactions.clear()
+        st.success("✅ Data berhasil di-refresh!")
+        st.rerun()
+
+    if do_fetch or do_preview:
+        if not email_addr or not app_password:
+            st.warning("Masukkan Gmail address dan App Password terlebih dahulu.")
+            st.stop()
+
+        with st.spinner(f"Menghubungkan ke Gmail `{email_addr}` dan membaca {days_back} hari terakhir..."):
+            txs, raw_emails, err = fetch_email_transactions(email_addr, app_password, days_back)
+
+        if err:
+            st.error(f"⚠️ Error: {err}")
+
+        col_a, col_b = st.columns(2)
+        col_a.metric("📬 Email bank ditemukan", len(raw_emails))
+        col_b.metric("💳 Transaksi berhasil di-parse", len(txs))
+
+        if not txs:
+            st.warning(
+                "Tidak ada transaksi yang berhasil di-parse. "
+                "Kemungkinan format email belum didukung atau tidak ada email bank masuk."
+            )
+            if raw_emails:
+                with st.expander("📋 Raw email ditemukan (untuk debug)"):
+                    for em in raw_emails[:5]:
+                        st.text(f"From   : {em['from']}")
+                        st.text(f"Subject: {em['subject']}")
+                        st.text(f"Date   : {em['date']}")
+                        st.text(f"Body   : {em['body'][:200]}")
+                        st.divider()
+        else:
+            df_preview = pd.DataFrame(txs)
+            st.markdown("#### 👀 Preview Transaksi Terdeteksi")
+            display_cols = [c for c in ["date", "description", "amount", "type", "pocket"] if c in df_preview.columns]
+            st.dataframe(df_preview[display_cols], use_container_width=True, hide_index=True)
+
+            if do_fetch:
+                with st.spinner("Menyimpan ke database Supabase..."):
+                    inserted, skipped = save_transactions(df_preview)
+                if inserted > 0:
+                    st.success(f"✅ **{inserted}** transaksi baru disimpan, **{skipped}** dilewati (duplikat).")
+                    st.info("💡 Pergi ke **Validasi Antrean** untuk mengkategorisasi transaksi baru.")
+                else:
+                    st.info(f"Tidak ada transaksi baru. {skipped} sudah ada di database (duplikat).")
+            else:
+                st.info("Mode preview — belum disimpan. Klik **'Cek & Simpan Email'** untuk menyimpan.")
+
+    st.divider()
+
+    # Histori transaksi dari email
+    st.markdown("#### 📊 Histori Transaksi dari Email")
+    df_all = load_all_transactions()
+    if not df_all.empty and "source" in df_all.columns:
+        email_txs = df_all[df_all["source"] == "email"].copy()
+        if not email_txs.empty:
+            st.metric("Total transaksi dari email", len(email_txs))
+            st.dataframe(
+                email_txs[["date", "description", "amount", "type", "sub_category", "pocket"]],
+                use_container_width=True, height=250, hide_index=True,
+            )
+        else:
+            st.info("Belum ada transaksi dari email. Gunakan tombol di atas untuk mulai sinkronisasi.")
+    else:
+        st.info("Belum ada data. Klik 'Cek & Simpan Email' untuk mulai.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 10 — UI: INGESTION DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
 def tab_ingestion():
@@ -812,13 +1065,14 @@ def tab_ingestion():
                     "date": m_date.strftime("%Y-%m-%d"), "description": m_desc,
                     "amount": m_amount, "type": m_type,
                     "sub_category": m_sub, "category": sub_to_cat(m_sub, m_type),
-                    "pocket": m_pocket,
+                    "pocket": m_pocket, "source": "manual",
                 }])
                 save_transactions(manual_df)
                 st.success("Tersimpan!")
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — UI: VALIDASI
+# SECTION 11 — UI: VALIDASI
 # ══════════════════════════════════════════════════════════════════════════════
 
 def tab_validation(df_all: pd.DataFrame):
@@ -858,8 +1112,9 @@ def tab_validation(df_all: pd.DataFrame):
         use_container_width=True, height=300,
     )
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 10 — MAIN ENTRY POINT
+# SECTION 12 — MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -876,164 +1131,28 @@ def main():
     st.sidebar.caption("The CFO Console Cloud v7.0")
     st.sidebar.divider()
 
-    nav_selection = st.sidebar.radio(
+    nav = st.sidebar.radio(
         "Navigasi Utama",
-        ["📊 Dashboard", "🎯 Budget vs Actual", "🗂️ Master Data", "📧 Email Sync", "⚙️ Validasi Antrean", "📥 Ingestion Data"],
+        ["📊 Dashboard", "🎯 Budget vs Actual", "🗂️ Master Data",
+         "📧 Email Sync", "⚙️ Validasi Antrean", "📥 Ingestion Data"],
         key="current_nav",
     )
 
     df_all = load_all_transactions()
 
-    if nav_selection == "📊 Dashboard":
+    if nav == "📊 Dashboard":
         tab_dashboard(df_all)
-    elif nav_selection == "🎯 Budget vs Actual":
+    elif nav == "🎯 Budget vs Actual":
         tab_budget_vs_actual(df_all)
-    elif nav_selection == "🗂️ Master Data":
+    elif nav == "🗂️ Master Data":
         tab_master_data()
-    elif nav_selection == "📧 Email Sync":
+    elif nav == "📧 Email Sync":
         tab_email_sync()
-    elif nav_selection == "📥 Ingestion Data":
-        tab_ingestion()
-    elif nav_selection == "⚙️ Validasi Antrean":
+    elif nav == "⚙️ Validasi Antrean":
         tab_validation(df_all)
+    elif nav == "📥 Ingestion Data":
+        tab_ingestion()
 
 
 if __name__ == "__main__":
     main()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 11 — UI: EMAIL SYNC (NEW)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def tab_email_sync():
-    """
-    Tab untuk tarik data transaksi dari email notifikasi bank via Gmail IMAP.
-    Menggunakan Gmail App Password (bukan password akun utama).
-    """
-    st.title("📧 Sinkronisasi Email Bank")
-    st.caption(
-        "Tarik otomatis transaksi dari email notifikasi Bank Jago, Jenius, dan Sinarmas. "
-        "Menggunakan Gmail IMAP — aman, tidak menyimpan password di server."
-    )
-
-    # ── Panduan Setup ─────────────────────────────────────────────────────────
-    with st.expander("ℹ️ Cara Setup Gmail App Password (klik untuk baca)", expanded=False):
-        st.markdown("""
-        **Langkah 1:** Aktifkan 2-Factor Authentication di akun Google kamu.
-
-        **Langkah 2:** Buka [https://myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
-
-        **Langkah 3:** Pilih app = **Mail**, device = **Other** → beri nama "CFO Console"
-
-        **Langkah 4:** Salin 16-karakter App Password yang muncul (format: xxxx xxxx xxxx xxxx)
-
-        **Langkah 5:** Masukkan App Password tersebut di form di bawah (tanpa spasi).
-
-        > ⚠️ App Password berbeda dari password Gmail biasa. Password Gmail kamu tetap aman.
-        """)
-
-    st.divider()
-
-    # ── Form Koneksi ──────────────────────────────────────────────────────────
-    with st.container(border=True):
-        st.markdown("#### 🔐 Konfigurasi Koneksi Gmail")
-
-        # Cek apakah credentials sudah tersimpan di secrets
-        has_secrets = (
-            "GMAIL_EMAIL" in st.secrets and
-            "GMAIL_APP_PASSWORD" in st.secrets
-        )
-
-        if has_secrets:
-            st.success("✅ Kredensial Gmail terdeteksi dari Streamlit Secrets.")
-            email_addr   = st.secrets["GMAIL_EMAIL"]
-            app_password = st.secrets["GMAIL_APP_PASSWORD"]
-            st.info(f"Akun terhubung: **{email_addr}**")
-        else:
-            st.info(
-                "💡 Tip: Untuk keamanan lebih baik, simpan kredensial di "
-                "**Streamlit Secrets** (Settings → Secrets) dengan key "
-                "`GMAIL_EMAIL` dan `GMAIL_APP_PASSWORD`."
-            )
-            col1, col2 = st.columns(2)
-            email_addr   = col1.text_input("Gmail Address", placeholder="sinta@gmail.com")
-            app_password = col2.text_input("App Password (16 karakter)", type="password",
-                                           placeholder="xxxxxxxxxxxxxxxxxxxx")
-
-        days_back = st.slider(
-            "Rentang waktu cek email (hari ke belakang)",
-            min_value=1, max_value=30, value=7,
-        )
-
-    st.divider()
-
-    # ── Tombol Refresh / Cek Email ────────────────────────────────────────────
-    col_btn1, col_btn2, _ = st.columns([1, 1, 3])
-
-    do_fetch  = col_btn1.button("🔄 Cek Email Sekarang", type="primary", use_container_width=True)
-    do_preview = col_btn2.button("👁️ Preview Saja (tanpa simpan)", use_container_width=True)
-
-    if do_fetch or do_preview:
-        if not email_addr or not app_password:
-            st.warning("Masukkan Gmail address dan App Password terlebih dahulu.")
-            st.stop()
-
-        with st.spinner(f"Menghubungkan ke Gmail dan membaca email {days_back} hari terakhir..."):
-            from email_parser import fetch_and_parse_transactions
-            txs, raw_emails, err = fetch_and_parse_transactions(
-                email_addr, app_password, days_back=days_back
-            )
-
-        # ── Tampilkan hasil ───────────────────────────────────────────────────
-        if err:
-            st.error(f"⚠️ Error sebagian: {err}")
-
-        st.markdown(f"**📬 Email bank ditemukan:** {len(raw_emails)} email")
-        st.markdown(f"**💳 Transaksi berhasil di-parse:** {len(txs)} transaksi")
-
-        if not txs:
-            st.warning(
-                "Tidak ada transaksi yang berhasil di-parse. "
-                "Kemungkinan: tidak ada email bank masuk, atau format email belum didukung."
-            )
-            if raw_emails:
-                with st.expander("📋 Raw email yang ditemukan (debug)"):
-                    for em in raw_emails[:5]:
-                        st.text(f"From: {em['from']}")
-                        st.text(f"Subject: {em['subject']}")
-                        st.text(f"Date: {em['date']}")
-                        st.divider()
-        else:
-            import pandas as pd
-            df_preview = pd.DataFrame(txs)
-            display_cols = ["date", "description", "amount", "type", "pocket", "bank_detected"]
-            display_cols = [c for c in display_cols if c in df_preview.columns]
-
-            st.markdown("#### 👀 Preview Transaksi")
-            st.dataframe(df_preview[display_cols], use_container_width=True, hide_index=True)
-
-            if do_fetch:
-                with st.spinner("Menyimpan ke database..."):
-                    inserted, skipped = save_transactions(df_preview)
-                st.success(f"✅ **{inserted}** transaksi baru disimpan, **{skipped}** dilewati (duplikat).")
-                if inserted > 0:
-                    st.info("💡 Pergi ke **Validasi Antrean** untuk mengkategorisasi transaksi baru.")
-            else:
-                st.info("Mode preview — transaksi belum disimpan. Klik 'Cek Email Sekarang' untuk simpan.")
-
-    # ── Status terakhir & histori email sync ─────────────────────────────────
-    st.divider()
-    st.markdown("#### 📊 Transaksi dari Email (tersimpan)")
-    df_all = load_all_transactions()
-    if not df_all.empty and "source" in df_all.columns:
-        email_txs = df_all[df_all.get("source", "") == "email"]
-        if not email_txs.empty:
-            st.dataframe(
-                email_txs[["date", "description", "amount", "type", "sub_category", "pocket"]],
-                use_container_width=True, height=250, hide_index=True,
-            )
-        else:
-            st.info("Belum ada transaksi yang diimport dari email.")
-    else:
-        st.info("Belum ada transaksi dari email. Gunakan tombol 'Cek Email Sekarang' di atas.")
