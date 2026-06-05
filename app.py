@@ -403,53 +403,264 @@ def extract_pdf_data(file, password, bank_type):
     transactions = []
     try:
         with pdfplumber.open(file, password=password if password else None) as pdf:
+            full_text = ""
             for page in pdf.pages:
-                text = page.extract_text()
-                if not text:
-                    continue
-                for line in text.split('\n'):
-                    if bank_type == "Sinarmas":
-                        match = re.search(r'(\d{2}\s[a-zA-Z]{3}\s\d{4})\s+(.+?)\s+([\d\,\.]+)\s*$', line)
-                        if match:
-                            amt_str = match.group(3).replace(',', '')
-                            if amt_str.count('.') > 1:
-                                amt_str = amt_str.rsplit('.', 1)[0]
-                            amount = float(amt_str)
-                            tx_type = "Income" if "Incoming" in line or "Credit" in line else "Expense"
-                            transactions.append({
-                                "date": datetime.strptime(match.group(1), "%d %b %Y").strftime("%Y-%m-%d"),
-                                "description": match.group(2)[:40], "amount": amount,
-                                "type": tx_type, "pocket": "Sinarmas",
-                                "sub_category": "uncategorized", "category": "Uncategorized",
-                                "source": "pdf",
-                            })
-                    elif bank_type == "Jenius CC":
-                        match = re.search(r'(\d{2}\s[a-zA-Z]{3}\s\d{4})\s+\d{2}\s[a-zA-Z]{3}\s\d{4}\s+(.+?)\s+([\d\,\.]+)(?:\sCR)?$', line)
-                        if match:
-                            amount = float(match.group(3).replace(',', ''))
-                            tx_type = "Income" if "CR" in line or "Pembayaran" in line else "Expense"
-                            transactions.append({
-                                "date": datetime.strptime(match.group(1), "%d %b %Y").strftime("%Y-%m-%d"),
-                                "description": match.group(2)[:40], "amount": amount,
-                                "type": tx_type, "pocket": "Jenius CC",
-                                "sub_category": "uncategorized", "category": "Uncategorized",
-                                "source": "pdf",
-                            })
-                    elif bank_type == "Bank Jago":
-                        match = re.search(r'(\d{2}\s[a-zA-Z]{3}\s\d{4})\s+\d{2}\.\d{2}\s+(.+?)\s+([\-\+])([\d\.]+)', line)
-                        if match:
-                            amount = float(match.group(4).replace('.', ''))
-                            tx_type = "Income" if match.group(3) == "+" else "Expense"
-                            transactions.append({
-                                "date": datetime.strptime(match.group(1), "%d %b %Y").strftime("%Y-%m-%d"),
-                                "description": match.group(2)[:40], "amount": amount,
-                                "type": tx_type, "pocket": "Bank Jago",
-                                "sub_category": "uncategorized", "category": "Uncategorized",
-                                "source": "pdf",
-                            })
+                t = page.extract_text()
+                if t:
+                    full_text += t + "\n"
+
+        if bank_type == "Bank Jago":
+            transactions = _parse_jago_pdf(full_text)
+        elif bank_type == "Sinarmas":
+            transactions = _parse_sinarmas_pdf(full_text)
+        elif bank_type == "Jenius CC":
+            transactions = _parse_jenius_cc_pdf(full_text)
+
     except Exception as e:
         return None, str(e)
-    return pd.DataFrame(transactions), None
+    return pd.DataFrame(transactions) if transactions else pd.DataFrame(), None
+
+
+def _parse_sinarmas_pdf(full_text):
+    """Parser PDF Statemen Rekening Bank Sinarmas.
+    Format: 'DD Mon YYYY  Keterangan [Detail]  AMOUNT  SALDO'
+    Cr/Credit = Income, Dr/Debit/Db = Expense.
+    """
+    SKIP = [
+        "BALANCE AT PERIOD","MOVEMENT TOTALS","CLOSING BALANCE","Laporan ini",
+        "This statement","Page","Halaman","RINGKASAN","Tanggal","No. Customer",
+        "Tabungan","No. Rekening","Mata Uang","Nilai Tukar","SINTA WULANDARI",
+        "DUSUN","PANGKALAN","KCP","Roxy","Jakarta","Date","Customer","Account",
+        "Currency","Category","Total","STATEMEN","Detail","Tgl","Keterangan",
+        "Debet","Kredit","Saldo","Debit","Credit","Balance","Riau",
+    ]
+    LINE = re.compile(
+        r"^(\d{2}\s+\w{3,}\s+\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$"
+    )
+    out = []
+    for line in full_text.split("\n"):
+        line = line.strip()
+        if not line or any(line.startswith(k) for k in SKIP):
+            continue
+        m = LINE.match(line)
+        if not m:
+            continue
+        date_str, ket, amt_str, _ = m.groups()
+        try:
+            tx_date = datetime.strptime(date_str.strip(), "%d %b %Y").strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+        try:
+            amount = float(amt_str.replace(",", ""))
+        except ValueError:
+            continue
+        if amount < 100:
+            continue
+        kl = ket.lower()
+        if re.search(r"\bcr\b|\bcredit\b", kl):
+            tx_type = "Income"
+        elif re.search(r"\bdr\b|\bdebit\b|\bdb\b", kl):
+            tx_type = "Expense"
+        elif "transfer" in kl:
+            tx_type = "Income"
+        else:
+            tx_type = "Expense"
+        desc = re.sub(
+            r"^(BI Fast Payment (Dr|Cr|Db)|Auto Transfer (Credit|Debit)|Transfer)\s+",
+            "", ket, flags=re.IGNORECASE
+        ).strip()
+        desc = re.sub(r"\s+\d{9,}$", "", desc).strip()
+        if any(k in desc.upper() for k in ["DT260", "PT BANK", "BIFAST"]):
+            continue
+        if not desc:
+            desc = ket[:40]
+        out.append({
+            "date": tx_date, "description": desc[:45], "amount": amount,
+            "type": tx_type, "pocket": "Sinarmas",
+            "sub_category": "uncategorized", "category": "Uncategorized",
+            "source": "pdf",
+        })
+    return out
+
+
+def _parse_jenius_cc_pdf(full_text):
+    """Parser PDF Billing Statement Jenius CC (SMBC Indonesia).
+    Format: 'DD Mon YYYY  DD Mon YYYY  DESKRIPSI  JUMLAH[CR]'
+    CR suffix = Income (refund). Skip cicilan, pembayaran tagihan, biaya admin.
+    Handle multi-baris (e.g. Claude.AI subscription yang terpotong).
+    """
+    SKIP = [
+        "Subtotal","BILLING STATEMENT","TANGGAL","Batas Kredit","Batas Penarikan",
+        "Sisa Kredit","Pemegang Kartu","Nomor Kartu","PT Bank SMBC","Bank Indonesia",
+        "SMBCI","d-Card","SINTA","4378","Split Pay","Pembayaran Tagihan",
+        "Syarat","Link T&C","Tenor","Rp.","dari 7","www.jenius","jenius.com",
+        "Ringkasan","DESKRIPSI","Total Tagihan","Pembayaran Minimum","Pemilik",
+        "Nomor Kartu Utama","Kolektibilitas","Tagihan","Mulai Juli",
+    ]
+    SKIP_DESC = [
+        "INSTALLMENT", "Pembayaran Kartu Kredit", "STAMP DUTY FEE",
+        "BIAYA LAYANAN NOTIFIKASI", "FEE - ", "NEW RETAIL PAYMENT",
+    ]
+    MONTHS = {
+        "Jan":"01","Feb":"02","Mar":"03","Apr":"04","Mei":"05","May":"05",
+        "Jun":"06","Jul":"07","Agu":"08","Aug":"08","Sep":"09",
+        "Okt":"10","Oct":"10","Nov":"11","Des":"12","Dec":"12",
+    }
+
+    # Gabungkan baris yang terpotong di tengah transaksi
+    # Claude.AI subscription muncul sebagai 2 baris:
+    # "04 Mei 2026  05 Mei 2026  CLAUDE.AI SUBSCRIPTION +14152360599 USCA (USD 20.00)"
+    # "(USD 1 = IDR 17,643.74)  352,874.71"
+    # Gabungkan dengan regex lookahead
+    text_joined = re.sub(r"\n(\([^)]+\))\s+(\d[\d,]*\.\d{2})", r" \1 \2", full_text)
+
+    LINE = re.compile(
+        r"^(\d{2}\s+\w{3}\s+\d{4})\s+\d{2}\s+\w{3}\s+\d{4}\s+(.+?)\s+(\d[\d,]*\.\d{2})(CR)?$",
+        re.IGNORECASE
+    )
+
+    out = []
+    for line in text_joined.split("\n"):
+        line = line.strip()
+        if not line or any(line.startswith(k) for k in SKIP):
+            continue
+        m = LINE.match(line)
+        if not m:
+            continue
+        date_str, desc_raw, amt_str, cr = m.groups()
+        parts = date_str.strip().split()
+        if len(parts) != 3:
+            continue
+        mo = MONTHS.get(parts[1][:3])
+        if not mo:
+            continue
+        tx_date = f"{parts[2]}-{mo}-{parts[0].zfill(2)}"
+        try:
+            amount = float(amt_str.replace(",", ""))
+        except ValueError:
+            continue
+        if amount < 100:
+            continue
+        if any(k.upper() in desc_raw.upper() for k in SKIP_DESC):
+            continue
+        tx_type = "Income" if (bool(cr) or "(REV)" in desc_raw.upper()) else "Expense"
+        desc = re.sub(r"\s+\d{10,}ID$", "", desc_raw).strip()
+        desc = re.sub(r"\s+\(USD[^)]+\)$", "", desc).strip()[:45]
+        out.append({
+            "date": tx_date, "description": desc, "amount": amount,
+            "type": tx_type, "pocket": "Jenius CC",
+            "sub_category": "uncategorized", "category": "Uncategorized",
+            "source": "pdf",
+        })
+    return out
+
+
+def _parse_jago_pdf(full_text: str) -> list[dict]:
+    """
+    Parser PDF Bank Jago — Laporan Keuangan Bulanan.
+    pdfplumber menggabungkan semua kolom dalam SATU baris per transaksi:
+    "DD Mon YYYY  NAMA/ENTITAS  Rincian Transaksi  [Catatan]  +/-JUMLAH  SALDO"
+    """
+    MONTHS_ID = {
+        "Januari":"01","Februari":"02","Maret":"03","April":"04",
+        "Mei":"05","Juni":"06","Juli":"07","Agustus":"08",
+        "September":"09","Oktober":"10","November":"11","Desember":"12",
+    }
+    INTERNAL_KW = [
+        "Pindah uang antar Kantong","Pindah uang antar kantong",
+        "Tambah Uang Kantong","Tarik Uang Kantong",
+    ]
+    SKIP_KW = [
+        "Bunga","Pajak Bunga","Laporan Keuangan Bulanan",
+        "PT Bank Jago","merupakan peserta","www.jago.com",
+        "RINGKASAN","SOROTAN","KANTONG","Total Saldo","Saldo Sebelumnya",
+        "Total Pemasukan","Total Pengeluaran","Saldo Akhir","Mata Uang",
+        "Tanggal & Waktu","INFO PENTING","Dokumen ini","Halaman",
+        "ID Kantong","Akun Aktif","berizin dan diawasi",
+    ]
+    RINCIAN_KW = [
+        "Transfer Masuk","Transfer Keluar","Pembayaran QRIS",
+        "Pembayaran dengan","Isi Saldo","Dana Masuk",
+        "Pembelian Saham","Pembayaran Produk","Jago Pay",
+    ]
+
+    # Regex: tanggal + middle + jumlah_bertanda + saldo
+    MAIN_LINE = re.compile(
+        r"^(\d{1,2}\s+(?:Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|"
+        r"September|Oktober|November|Desember)\s+\d{4})"
+        r"\s+(.+?)\s+"
+        r"([+\-][\d\.]+(?:,[\d]{2})?)\s+"
+        r"([\d\.]+(?:,[\d]{2})?)$"
+    )
+
+    def parse_date(s):
+        parts = s.strip().split()
+        if len(parts) == 3:
+            mo = MONTHS_ID.get(parts[1])
+            if mo:
+                return f"{parts[2]}-{mo}-{parts[0].zfill(2)}"
+        return None
+
+    def parse_amount(s):
+        s = s.lstrip("+").lstrip("-")
+        if "," in s:
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(".", "")
+        try:
+            return float(s)
+        except:
+            return None
+
+    transactions = []
+    for line in full_text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if any(line.startswith(k) for k in SKIP_KW):
+            continue
+        if any(k in line for k in INTERNAL_KW):
+            continue
+
+        m = MAIN_LINE.match(line)
+        if not m:
+            continue
+
+        date_str, middle, amount_str, _ = m.groups()
+        tx_date = parse_date(date_str)
+        if not tx_date:
+            continue
+
+        amount = parse_amount(amount_str)
+        if not amount or amount < 500:
+            continue
+
+        tx_type = "Income" if amount_str.startswith("+") else "Expense"
+
+        # Bersihkan deskripsi
+        desc = middle
+        for kw in RINCIAN_KW:
+            desc = desc.replace(kw, "").strip()
+        desc = re.sub(r"\s+ID#\s+\S+$", "", desc).strip()
+        desc = desc[:50]
+
+        if "Transfer Keluar" in middle:
+            desc = f"Transfer ke {desc}"[:50]
+        elif "Transfer Masuk" in middle:
+            desc = f"Transfer dari {desc}"[:50]
+
+        transactions.append({
+            "date":         tx_date,
+            "description":  desc,
+            "amount":       amount,
+            "type":         tx_type,
+            "pocket":       "Bank Jago",
+            "sub_category": "uncategorized",
+            "category":     "Uncategorized",
+            "source":       "pdf",
+        })
+
+    return transactions
 
 
 # ══════════════════════════════════════════════════════════════════════════════
